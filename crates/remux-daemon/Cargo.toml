@@ -1,0 +1,24 @@
+[package]
+name = "remux-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "Remux session daemon"
+
+[[bin]]
+name = "remuxd"
+path = "src/main.rs"
+
+[dependencies]
+remux-core = { path = "../remux-core" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+portable-pty = "0.8"
+nix = { version = "0.28", features = ["signal", "process", "term"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+alacritty_terminal = "0.26"

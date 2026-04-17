@@ -1,0 +1,15 @@
+[package]
+name = "remux-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Remux terminal UI"
+
+[[bin]]
+name = "remux-tui"
+path = "src/main.rs"
+
+[dependencies]
+remux-core = { path = "../remux-core" }
+tokio = { version = "1", features = ["full"] }
+ratatui = "0.26"
+crossterm = "0.27"

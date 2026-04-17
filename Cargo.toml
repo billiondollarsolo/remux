@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "crates/remux-core",
+    "crates/remux-daemon",
+    "crates/remux-cli",
+    "crates/remux-tui",
+    "crates/remux-testkit",
+]
+resolver = "2"

@@ -1,0 +1,18 @@
+[package]
+name = "remux-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core types and protocol definitions for Remux"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+toml = "0.8"
+uuid = { version = "1", features = ["serde", "v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+dirs = "5"
+tokio = { version = "1", features = ["io-util"] }
+
+[dev-dependencies]

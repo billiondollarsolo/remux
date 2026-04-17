@@ -1,0 +1,20 @@
+Remux Implementation Progress
+==============================
+
+Phase 1: Local Runtime
+  Step 1: Bootstrap (US-1)          [DONE]
+  Step 2: Core Types (US-2)         [DONE]
+  Step 3: Daemon Socket (US-3)      [DONE]
+  Step 4: Session Creation (US-4)   [DONE]
+  Step 5: Attach/Detach (US-5)      [DONE]
+  Step 6: Scrollback (US-6)         [DONE]
+  Step 7: VT State (US-7)           [DONE]
+  Step 8: Kill/Inspect/Rename (US-8, US-9) [DONE]
+  Step 9: Auto-Spawn (US-10)        [DONE]
+  Step 10: TUI (US-11)              [DONE]
+  Step 11: Polish (US-12)           [DONE]
+
+Phase 2: SSH Transport
+  Step 12: SSH Connection (US-13)   [PENDING]
+  Step 13: Remote Bridge (US-14)    [PENDING]
+  Step 14: Remote CLI (US-15, US-16) [PENDING]

@@ -1,0 +1,88 @@
+{
+  "title": "Remux — Implementation Specification",
+  "feature": "review spec.md and lets plan this entire peoject out",
+  "created": "2026-04-17",
+  "status": "pending",
+  "decisions": {
+    "vt_library": "alacritty_terminal",
+    "ipc_encoding": "JSON dev / bincode prod",
+    "daemon_start": "auto-spawn",
+    "session_lookup": "name-based",
+    "attach_conflict": "steal control",
+    "scrollback": "in-memory ring buffer 20000 lines",
+    "ssh_library": "russh",
+    "config_format": "TOML",
+    "detach_key": "Ctrl-Q",
+    "default_shell": "$SHELL",
+    "session_limit": "unlimited",
+    "duplicate_session": "error",
+    "crash_recovery": "not supported",
+    "host_config": "SSH config + hosts.toml overrides",
+    "platforms": ["linux", "macos"],
+    "testing_strategy": "integration-first",
+    "scope": "2 phases (local + SSH), no gateway/web/fleet",
+    "tui": "ratatui session manager in Phase 1",
+    "library": "remux-core as Rust library crate",
+    "backpressure": "bounded per-client queues, drop oldest on overflow",
+    "persistence": "metadata only to disk, scrollback in-memory only",
+    "observability": "tracing + tracing-subscriber, structured logging"
+  },
+  "phases": [
+    {
+      "name": "Phase 1: Local Runtime",
+      "user_stories": ["US-1", "US-2", "US-3", "US-4", "US-5", "US-6", "US-7", "US-8", "US-9", "US-10", "US-11", "US-12"],
+      "steps": [
+        {"step": 1, "name": "Bootstrap", "stories": ["US-1"], "verify": "cargo build && cargo test && cargo clippy"},
+        {"step": 2, "name": "Core Types", "stories": ["US-2"], "verify": "cargo test"},
+        {"step": 3, "name": "Daemon Socket", "stories": ["US-3"], "verify": "cargo test (integration)"},
+        {"step": 4, "name": "Session Creation", "stories": ["US-4"], "verify": "remux new && remux ls"},
+        {"step": 5, "name": "Attach/Detach", "stories": ["US-5"], "verify": "remux attach, Ctrl-Q, reattach"},
+        {"step": 6, "name": "Scrollback", "stories": ["US-6"], "verify": "detach, reattach, see history"},
+        {"step": 7, "name": "VT State", "stories": ["US-7"], "verify": "vim detach reattach renders correctly"},
+        {"step": 8, "name": "Kill/Inspect/Rename", "stories": ["US-8", "US-9"], "verify": "remux kill, inspect, rename"},
+        {"step": 9, "name": "Auto-Spawn", "stories": ["US-10"], "verify": "kill daemon, run command, auto-restarts"},
+        {"step": 10, "name": "TUI", "stories": ["US-11"], "verify": "remux tui, browse, attach"},
+        {"step": 11, "name": "Polish", "stories": ["US-12"], "verify": "cargo test && cargo clippy && cargo build --release"}
+      ]
+    },
+    {
+      "name": "Phase 2: SSH Transport",
+      "user_stories": ["US-13", "US-14", "US-15", "US-16"],
+      "steps": [
+        {"step": 12, "name": "SSH Connection", "stories": ["US-13"], "verify": "cargo test (SSH config parsing)"},
+        {"step": 13, "name": "Remote Bridge", "stories": ["US-14"], "verify": "integration test through bridge"},
+        {"step": 14, "name": "Remote CLI Commands", "stories": ["US-15", "US-16"], "verify": "remux connect localhost"}
+      ]
+    }
+  ],
+  "user_stories": [
+    {"id": "US-1", "title": "Workspace Bootstrap", "phase": 1},
+    {"id": "US-2", "title": "Session Data Model and Protocol", "phase": 1},
+    {"id": "US-3", "title": "Daemon Unix Socket Server", "phase": 1},
+    {"id": "US-4", "title": "PTY Session Creation", "phase": 1},
+    {"id": "US-5", "title": "Session Attach/Detach Loop", "phase": 1},
+    {"id": "US-6", "title": "Scrollback Buffer", "phase": 1},
+    {"id": "US-7", "title": "Virtual Terminal State", "phase": 1},
+    {"id": "US-8", "title": "Session Kill and Cleanup", "phase": 1},
+    {"id": "US-9", "title": "Session Inspect and Rename", "phase": 1},
+    {"id": "US-10", "title": "Auto-Spawn Daemon", "phase": 1},
+    {"id": "US-11", "title": "TUI Session Manager", "phase": 1},
+    {"id": "US-12", "title": "Service Management Files", "phase": 1},
+    {"id": "US-13", "title": "SSH Connection Infrastructure", "phase": 2},
+    {"id": "US-14", "title": "Remote Bridge Process", "phase": 2},
+    {"id": "US-15", "title": "Remote Session Management", "phase": 2},
+    {"id": "US-16", "title": "hosts.toml Configuration", "phase": 2}
+  ],
+  "verification": {
+    "commands": ["cargo test", "cargo build", "cargo clippy"],
+    "manual_test_matrix": ["bash", "zsh", "fish", "vim", "htop", "less", "cargo watch"]
+  },
+  "divergences_from_spec_md": [
+    {"spec_md": "4 phases", "impl_spec": "2 phases", "reason": "user: skip web/gateway/fleet"},
+    {"spec_md": "vt100 first", "impl_spec": "alacritty_terminal", "reason": "user chose for robustness"},
+    {"spec_md": "append suffix on collision", "impl_spec": "error on duplicate", "reason": "user chose explicit error"},
+    {"spec_md": "default_shell=/bin/bash", "impl_spec": "$SHELL env var", "reason": "user chose env var respect"},
+    {"spec_md": "remux-tui optional later", "impl_spec": "Phase 1 MVP", "reason": "user wanted TUI from start"},
+    {"spec_md": "no detach key", "impl_spec": "Ctrl-Q", "reason": "user chose Ctrl-Q"}
+  ]
+}

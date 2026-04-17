@@ -1,0 +1,10 @@
+[package]
+name = "remux-testkit"
+version = "0.1.0"
+edition = "2021"
+description = "Test helpers for Remux integration tests"
+
+[dependencies]
+remux-core = { path = "../remux-core" }
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
