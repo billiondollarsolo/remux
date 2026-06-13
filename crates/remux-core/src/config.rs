@@ -105,7 +105,7 @@ fn default_shell() -> String {
 }
 
 fn default_detach_key() -> String {
-    "ctrl-q".to_string()
+    "ctrl-a".to_string()
 }
 
 impl Default for ClientConfig {
@@ -132,7 +132,7 @@ mod tests {
         assert_eq!(config.daemon.max_scrollback_lines, 20_000);
         assert!(!config.daemon.persist_scrollback);
         assert_eq!(config.daemon.cleanup_exited_after_hours, 168);
-        assert_eq!(config.client.detach_key, "ctrl-q");
+        assert_eq!(config.client.detach_key, "ctrl-a");
     }
 
     #[test]
@@ -159,7 +159,7 @@ detach_key = "ctrl-a"
     fn config_empty_toml_uses_defaults() {
         let config = Config::from_toml_str("").expect("parse empty");
         assert_eq!(config.daemon.max_scrollback_lines, 20_000);
-        assert_eq!(config.client.detach_key, "ctrl-q");
+        assert_eq!(config.client.detach_key, "ctrl-a");
     }
 
     #[test]

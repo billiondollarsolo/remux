@@ -10,13 +10,14 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand};
+use clap_complete::Shell;
 use remux_core::Config;
 
 use client::RemuxClient;
 
 #[derive(Parser)]
 #[command(name = "remux", version, about = "Terminal session runtime")]
-struct Cli {
+pub struct Cli {
     /// Path to the daemon socket (overrides config)
     #[arg(long, global = true)]
     socket: Option<String>,
@@ -40,6 +41,7 @@ enum Commands {
         command: Vec<String>,
     },
     /// List sessions
+    #[command(visible_alias = "list")]
     Ls {
         /// Output as JSON
         #[arg(long)]
@@ -49,10 +51,17 @@ enum Commands {
         preview: bool,
     },
     /// Attach to a session
+    #[command(visible_aliases = ["a", "at"])]
     Attach {
         /// Session name or ID
         name: String,
+        /// Attach read-only (Observer): render output but never forward input
+        #[arg(long)]
+        read_only: bool,
     },
+    /// Launch the interactive session-manager UI
+    #[command(visible_alias = "i")]
+    Ui,
     /// Send input to a session without attaching (fire-and-forget)
     #[command(group(
         clap::ArgGroup::new("input")
@@ -137,9 +146,16 @@ enum Commands {
         new_name: String,
     },
     /// Kill a session
+    #[command(visible_alias = "k")]
     Kill {
         /// Session name or ID
         name: String,
+    },
+    /// Generate shell completions (bash, zsh, fish, ...)
+    Completions {
+        /// Target shell
+        #[arg(value_enum)]
+        shell: Shell,
     },
 }
 
@@ -185,6 +201,15 @@ async fn main() {
 
     let cli = Cli::parse();
 
+    // `completions` is a purely local command: it needs no daemon.
+    if let Commands::Completions { shell } = cli.command {
+        if let Err(e) = cmd::completions::run(shell) {
+            eprintln!("error: {e}");
+            process::exit(exit::exit_code_for(&e));
+        }
+        return;
+    }
+
     let config = load_config();
     let socket_path = get_socket_path(cli.socket.as_deref(), &config);
 
@@ -212,9 +237,13 @@ async fn main() {
             command,
         } => cmd::new::run(&mut client, name, command, json).await,
         Commands::Ls { json, preview } => cmd::ls::run(&mut client, json, preview).await,
-        Commands::Attach { name } => {
-            cmd::attach::run(client, name, &config.client.detach_key).await
+        Commands::Attach { name, read_only } => {
+            cmd::attach::run(client, name, &config.client.detach_key, read_only).await
         }
+        Commands::Ui => match remux_tui::run(socket_path.clone()).await {
+            Ok(()) => Ok(()),
+            Err(_) => process::exit(1),
+        },
         Commands::Send {
             name,
             text,
@@ -296,6 +325,8 @@ async fn main() {
             cmd::rename::run(&mut client, old_name, new_name).await
         }
         Commands::Kill { name } => cmd::kill::run(&mut client, name).await,
+        // Handled before the daemon connection above.
+        Commands::Completions { .. } => unreachable!("completions handled early"),
     };
 
     if let Err(e) = result {

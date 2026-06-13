@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Remux terminal UI"
 
+[lib]
+name = "remux_tui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "remux-tui"
 path = "src/main.rs"
