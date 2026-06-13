@@ -1,6 +1,7 @@
 pub mod attach;
 pub mod bridge;
 pub mod completions;
+pub mod fleet;
 pub mod inspect;
 pub mod kill;
 pub mod logs;

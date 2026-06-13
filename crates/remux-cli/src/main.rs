@@ -166,11 +166,47 @@ enum Commands {
         #[arg(value_enum)]
         shell: Shell,
     },
+    /// Multi-host fleet discovery over SSH (client-side fan-out, no control plane)
+    #[command(visible_alias = "f", subcommand)]
+    Fleet(FleetCommands),
     /// Internal: pipe the protocol between stdin/stdout and the local daemon
     /// socket. Run on a remote host via `ssh <host> remux bridge` to back the
     /// `--host` remote transport. Not intended for direct use.
     #[command(hide = true)]
     Bridge,
+}
+
+#[derive(Subcommand)]
+enum FleetCommands {
+    /// List the configured fleet hosts (name, ssh target, labels)
+    Hosts {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List sessions across the fleet (concurrent fan-out over SSH)
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Output as JSON: [{ host, ssh, ok, error, sessions }]
+        #[arg(long)]
+        json: bool,
+        /// Only query hosts matching this label (key=value). Repeatable;
+        /// a host must match ALL given labels.
+        #[arg(long = "label")]
+        labels: Vec<String>,
+    },
+    /// Attach to <host>:<session>, resolving <host> via the registry
+    #[command(visible_aliases = ["a", "at"])]
+    Attach {
+        /// Target in the form <host>:<session> (e.g. devbox:backend)
+        target: String,
+        /// Attach read-only (Observer): render output but never forward input
+        #[arg(long)]
+        read_only: bool,
+        /// Disable the persistent bottom status line for this attach
+        #[arg(long)]
+        no_status: bool,
+    },
 }
 
 /// Load configuration from the first existing config file location, falling
@@ -240,6 +276,14 @@ async fn main() {
             eprintln!("error: {e}");
             process::exit(exit::exit_code_for(&e));
         }
+        return;
+    }
+
+    // `fleet` manages its own per-host transports (fan-out over SSH for `ls`,
+    // a remote bridge for `attach`); it never touches the local daemon socket.
+    // Handle it before the local/remote client connection below.
+    if let Commands::Fleet(fleet_cmd) = cli.command {
+        run_fleet(fleet_cmd, &config).await;
         return;
     }
 
@@ -383,10 +427,79 @@ async fn main() {
         // Handled before the daemon connection above.
         Commands::Completions { .. } => unreachable!("completions handled early"),
         Commands::Bridge => unreachable!("bridge handled early"),
+        Commands::Fleet(_) => unreachable!("fleet handled early"),
     };
 
     if let Err(e) = result {
         eprintln!("error: {e}");
         process::exit(exit::exit_code_for(&e));
+    }
+}
+
+/// Run a `remux fleet` subcommand. Fleet commands operate on the configured
+/// host registry and the SSH transport directly — they do not connect to the
+/// local daemon — so this is dispatched before the normal client setup.
+async fn run_fleet(cmd: FleetCommands, config: &Config) {
+    let hosts = &config.fleet.hosts;
+    match cmd {
+        FleetCommands::Hosts { json } => {
+            cmd::fleet::run_hosts(hosts, json);
+        }
+        FleetCommands::Ls { json, labels } => {
+            // Parse `--label k=v` selectors up front so a bad one fails clearly.
+            let mut selectors = Vec::with_capacity(labels.len());
+            for l in &labels {
+                match cmd::fleet::parse_label(l) {
+                    Ok(pair) => selectors.push(pair),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        process::exit(1);
+                    }
+                }
+            }
+            cmd::fleet::run_ls(hosts, &selectors, json).await;
+        }
+        FleetCommands::Attach {
+            target,
+            read_only,
+            no_status,
+        } => {
+            // Resolve <host>:<session> against the registry, then reuse the
+            // existing remote attach path (effectively `--host <ssh> attach`).
+            let parsed = match cmd::fleet::parse_fleet_target(&target) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            };
+            let host = match cmd::fleet::resolve_host(hosts, &parsed.host) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            };
+            let client = match RemuxClient::connect_remote(&host.ssh).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(exit::exit_code_for(&e));
+                }
+            };
+            let status_line = config.client.status_line && !no_status;
+            if let Err(e) = cmd::attach::run(
+                client,
+                parsed.session,
+                &config.client.detach_key,
+                read_only,
+                status_line,
+            )
+            .await
+            {
+                eprintln!("error: {e}");
+                process::exit(exit::exit_code_for(&e));
+            }
+        }
     }
 }

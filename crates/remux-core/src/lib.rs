@@ -5,7 +5,7 @@ pub mod protocol;
 pub mod session;
 pub mod terminal;
 
-pub use config::Config;
+pub use config::{Config, FleetConfig, FleetHost};
 pub use error::RemuxError;
 pub use protocol::{
     AttachBootstrap, AttachMode, ClientId, CreateSessionRequest, Event, Request, Response,

@@ -174,6 +174,47 @@ SSH provides the auth and encryption (your keys, agent, config, and
 `known_hosts`); remux adds nothing to the trusted core. `remux` must be on the
 remote host's `PATH`.
 
+### Fleet (multi-host)
+
+Register a static set of hosts and query them all at once. `remux fleet`
+(alias `f`) is **client-side fan-out over the SSH transport above** — it runs
+`ssh <host> remux bridge` against each configured host concurrently. There is
+**no control-plane service**: no daemon registry, no gateway, no RBAC. The
+federated control plane (intent routing, cross-host migration) is still future
+work (see [`docs/AGENT_API_PLAN.md`](docs/AGENT_API_PLAN.md) §8).
+
+Configure hosts in your config file with `[[fleet.hosts]]` blocks:
+
+```toml
+[[fleet.hosts]]
+name = "devbox"
+ssh = "user@devbox"
+labels = { project = "api", env = "dev" }
+
+[[fleet.hosts]]
+name = "prod1"
+ssh = "ops@prod1.example.com"
+labels = { env = "prod" }
+```
+
+Then:
+
+```sh
+remux fleet hosts                      # list configured hosts + labels
+remux fleet ls                         # sessions across the whole fleet
+remux fleet ls --json                  # [{ host, ssh, ok, error, sessions }]
+remux fleet ls --label env=dev         # only hosts matching ALL given labels
+remux fleet attach devbox:backend      # resolve `devbox` → ssh, attach `backend`
+```
+
+`fleet ls` queries hosts in parallel and adds a leading `HOST` column.
+**Unreachable hosts never abort the command**: a host that fails to connect is
+shown as `unreachable` (with the error in place of the command) and the
+reachable hosts still list normally. In `--json` each host carries
+`"ok": false` and an `"error"` string. `fleet attach <host>:<session>` resolves
+`<host>` as a registry **name** (not an ssh target) and reuses the same remote
+attach path as `--host`, erroring clearly if the name isn't registered.
+
 ### Inspect, rename, kill
 
 ```sh
@@ -309,6 +350,12 @@ detach_key = "ctrl-a"                               # prefix key; Ctrl-a d detac
 
 [data]
 dir = "/home/user/.local/share/remux"               # default: dirs::data_dir()/remux
+
+# Optional client-side fleet registry for `remux fleet` (fan-out over SSH).
+[[fleet.hosts]]
+name = "devbox"                                     # logical name (fleet attach devbox:...)
+ssh = "user@devbox"                                 # ssh target
+labels = { project = "api", env = "dev" }           # filter with `fleet ls --label k=v`
 ```
 
 ### Paths

@@ -118,7 +118,7 @@ over an API.** That is the moat.
 | AW3 | WebSocket interactive stream (binary framing) ✅ **landed** | Live terminal I/O + structured `/events` channel | AW2 | P1 | M |
 | AW4 | Auth & TLS posture (v1: bearer + TLS) ✅ **landed (v1)** | Token auth, TLS termination, deny-by-default | AW2 | P0 (ships with AW2) | M |
 | AW5 | Browser terminal (xterm.js consumer) | Reference web UI — **listed last, on purpose** | AW3, AW4 | P2 | M |
-| AW6 | Fleet / discovery model | Host registry, cross-host session discovery, intent routing | AW1, AW2 | P2 (design now, build later) | XL |
+| AW6 | Fleet / discovery model | **v1 client-side discovery: done** (host registry + `fleet ls`/`hosts`/`attach` fan-out over SSH); **control plane: deferred** (federation, RBAC, intent routing, migration) | AW1, AW2 | P2 (v1 shipped; control plane later) | XL |
 
 **Critical path:** AW0 → AW2 + AW4 (the structured API, secured) is the
 differentiator and ships first. AW1 (SSH) is parallel and serves the human
@@ -797,9 +797,31 @@ the API, not to *be* the product.
 
 ## 8. AW6 — Fleet / Discovery Model (Design-Level, the Longer-Term Moat)
 
+> **Status update:** the **client-side first slice has SHIPPED.** A static host
+> registry (`[[fleet.hosts]]` in config — `name`, `ssh`, `labels`) plus the
+> `remux fleet` command (alias `f`) deliver multi-host **discovery** today:
+> `fleet hosts` lists the registry; `fleet ls [--json] [--label k=v]…` fans out
+> **concurrently** over the existing SSH transport (`ssh <host> remux bridge`),
+> lists each host's sessions, and aggregates them tagged by host; `fleet attach
+> <host>:<session>` resolves a registry name to its ssh target and reuses the
+> remote attach path. Unreachable hosts are reported per-host (a row/JSON entry
+> marked `unreachable`/`"ok": false`) and **never abort** the whole command. The
+> connect+list step goes through an **injectable connector** (`gather_sessions`
+> takes a `Fn(&FleetHost) -> Command`) so tests substitute a local
+> `remux bridge --socket …` for real `ssh`; the aggregation/row/JSON building is
+> a set of **pure** functions (`build_rows`/`build_json`). This is purely a
+> **client** feature: no control-plane service, no gateway/daemon changes, no
+> RBAC — `remuxd` stays Unix-socket-only. See
+> `crates/remux-core/src/config.rs` (`FleetConfig`/`FleetHost`),
+> `crates/remux-cli/src/cmd/fleet.rs`, and `crates/remux-cli/tests/fleet.rs`.
+> The federated control plane below (§8.1's registry *service*, §8.1's intent
+> routing, §8.4) remains deferred.
+
 **Goal:** Sketch the layer that turns "one daemon, one host" into "one pane for
 humans **and** agents across a fleet." This is `spec.md` §10. We **design** it
-now to keep AW0–AW4 forward-compatible; we **build** it later.
+now to keep AW0–AW4 forward-compatible; we **build** it later. The v1
+client-side discovery slice (host registry + SSH fan-out) is now built (see the
+status note above); the control-plane build-out remains design-level.
 
 ### 8.1 Concepts (`spec.md` §10: Host, Session, Workspace, Agent)
 
@@ -840,9 +862,23 @@ view because every session is already introspectable as data.
 
 ### 8.4 Explicitly deferred
 
-Full control-plane build-out, RBAC, multi-tenant isolation, cross-host session
-migration, and agent-ownership arbitration are **future work**. This section is a
-design contract, not a workstream with code DoD.
+The **client-side discovery slice has shipped** (see the §8 status note): static
+host registry, `fleet hosts`/`fleet ls`/`fleet attach`, concurrent SSH fan-out,
+label filtering, per-host error isolation, `--json`. What remains **future
+work**:
+
+- the control-plane **registry service** (gateway→control-plane registration,
+  health, a cached fleet index) — today the registry is a static client-side
+  config list, queried live per command;
+- **RBAC**, multi-tenant isolation, and principal-scoped tokens fleet-wide;
+- **intent-based routing** (`remux open --project api --env dev` resolving
+  intent → host → existing-or-new session);
+- **cross-host session migration** and agent-ownership arbitration.
+
+The shipped slice is forward-compatible with all of the above: the registry
+shape (`name`/`ssh`/`labels`) and the fan-out/aggregation seam generalize from
+"static config + SSH" to "control-plane index + gateway REST" without a client
+redesign.
 
 ---
 

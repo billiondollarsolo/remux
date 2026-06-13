@@ -11,6 +11,8 @@ pub struct Config {
     pub daemon: DaemonConfig,
     #[serde(default)]
     pub client: ClientConfig,
+    #[serde(default)]
+    pub fleet: FleetConfig,
 }
 
 impl Config {
@@ -126,6 +128,33 @@ impl Default for ClientConfig {
     }
 }
 
+/// Fleet (multi-host) configuration.
+///
+/// This is the **client-side** host registry for the AW6 v1 fleet slice: a
+/// static list of SSH-reachable hosts the `remux fleet` command fans out over.
+/// There is no control-plane service here — discovery is a concurrent fan-out
+/// over the existing SSH transport (`ssh <host> remux bridge`). Federated
+/// control-plane routing/RBAC remain future work (see `AGENT_API_PLAN.md` §8).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FleetConfig {
+    /// Registered hosts. Empty when no `[[fleet.hosts]]` blocks are present.
+    #[serde(default)]
+    pub hosts: Vec<FleetHost>,
+}
+
+/// A single registered fleet host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FleetHost {
+    /// Logical name used to refer to the host (e.g. `"devbox"`). This is what
+    /// `remux fleet attach <name>:<session>` resolves against.
+    pub name: String,
+    /// SSH target passed to `ssh` (e.g. `"user@devbox"`).
+    pub ssh: String,
+    /// Arbitrary labels for filtering (e.g. `project=api`, `env=dev`).
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +207,63 @@ status_line = false
     #[test]
     fn config_roundtrip_toml() {
         let config = Config::default();
+        let toml_str = toml::to_string(&config).expect("serialize to toml");
+        let back: Config = toml::from_str(&toml_str).expect("deserialize from toml");
+        assert_eq!(config, back);
+    }
+
+    #[test]
+    fn fleet_absent_defaults_to_empty() {
+        let config = Config::from_toml_str("").expect("parse empty");
+        assert!(config.fleet.hosts.is_empty());
+    }
+
+    #[test]
+    fn fleet_hosts_parse_with_labels() {
+        let toml = r#"
+[[fleet.hosts]]
+name = "devbox"
+ssh = "user@devbox"
+labels = { project = "api", env = "dev" }
+
+[[fleet.hosts]]
+name = "prod1"
+ssh = "ops@prod1.example.com"
+"#;
+        let config = Config::from_toml_str(toml).expect("parse fleet");
+        assert_eq!(config.fleet.hosts.len(), 2);
+
+        let devbox = &config.fleet.hosts[0];
+        assert_eq!(devbox.name, "devbox");
+        assert_eq!(devbox.ssh, "user@devbox");
+        assert_eq!(
+            devbox.labels.get("project").map(String::as_str),
+            Some("api")
+        );
+        assert_eq!(devbox.labels.get("env").map(String::as_str), Some("dev"));
+
+        let prod = &config.fleet.hosts[1];
+        assert_eq!(prod.name, "prod1");
+        assert_eq!(prod.ssh, "ops@prod1.example.com");
+        // Labels default to empty when the block omits them.
+        assert!(prod.labels.is_empty());
+    }
+
+    #[test]
+    fn fleet_roundtrip_toml() {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("project".to_string(), "api".to_string());
+        labels.insert("env".to_string(), "dev".to_string());
+        let config = Config {
+            fleet: FleetConfig {
+                hosts: vec![FleetHost {
+                    name: "devbox".to_string(),
+                    ssh: "user@devbox".to_string(),
+                    labels,
+                }],
+            },
+            ..Config::default()
+        };
         let toml_str = toml::to_string(&config).expect("serialize to toml");
         let back: Config = toml::from_str(&toml_str).expect("deserialize from toml");
         assert_eq!(config, back);
