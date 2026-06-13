@@ -58,8 +58,9 @@ still wins there.
 
 - **remux-core** — shared types, protocol definitions, config, framing
 - **remux-daemon** — session lifecycle, PTY management, VT state, IPC server
-- **remux-cli** — command-line interface with auto-daemon-spawn
+- **remux-cli** — command-line interface with auto-daemon-spawn (and SSH remote transport)
 - **remux-tui** — ratatui-based session browser
+- **remux-gateway** — TLS HTTP/WebSocket server exposing the agent-native `/v1` API
 - **remux-testkit** — test harness and client for integration tests
 
 ## Build
@@ -71,13 +72,14 @@ cargo build
 cargo build --release
 ```
 
-Produces three binaries:
+Produces four binaries:
 
-| Binary      | Crate         | Purpose                  |
-|-------------|---------------|--------------------------|
-| `remux`     | remux-cli     | CLI client               |
-| `remuxd`    | remux-daemon  | Background session daemon|
-| `remux-tui` | remux-tui     | Terminal UI              |
+| Binary          | Crate         | Purpose                            |
+|-----------------|---------------|------------------------------------|
+| `remux`         | remux-cli     | CLI client                         |
+| `remuxd`        | remux-daemon  | Background session daemon          |
+| `remux-tui`     | remux-tui     | Terminal UI (also `remux ui`)      |
+| `remux-gateway` | remux-gateway | TLS HTTP/WebSocket API server      |
 
 ## Install
 
@@ -155,6 +157,23 @@ remux wait api --exit                # block until the session exits (returns it
 attached client. Exit codes: `0` success, `1` generic, `3` session not found,
 `4` timeout (`wait`), `5` permission denied, `6` daemon unreachable.
 
+### Remote access over SSH
+
+Any command takes a global `--host <ssh-target>` flag to run against a remote
+host's daemon — no exposed ports, no extra config. It works by running the same
+framed protocol over `ssh <host> remux bridge` (a hidden connect-and-pipe
+subcommand), so the remote `remuxd` stays Unix-socket-only:
+
+```sh
+remux --host devbox ls                 # list sessions on devbox
+remux --host devbox attach backend     # attach to a remote session
+remux --host devbox send build --text "make\n"
+```
+
+SSH provides the auth and encryption (your keys, agent, config, and
+`known_hosts`); remux adds nothing to the trusted core. `remux` must be on the
+remote host's `PATH`.
+
 ### Inspect, rename, kill
 
 ```sh
@@ -218,6 +237,59 @@ remuxd                       # uses default config + socket paths
 remuxd -c /path/to/config.toml
 remuxd -s /tmp/custom.sock
 ```
+
+## Gateway (HTTP / WebSocket API)
+
+`remux-gateway` exposes the daemon as an authenticated, TLS-secured **agent-native
+`/v1` API** — the thing a plain web terminal can't do: structured session state,
+not just a byte stream. It runs as a **separate process** and connects to the
+daemon over the local Unix socket; **`remuxd` never listens on a network port**.
+
+```sh
+remux-gateway                                    # TLS on 127.0.0.1:8443; self-signed cert + random token (logged)
+remux-gateway --listen 0.0.0.0:8443 \
+  --token "$RW_TOKEN" --read-token "$RO_TOKEN" \
+  --tls-cert cert.pem --tls-key key.pem
+```
+
+- **TLS always on.** Supply `--tls-cert`/`--tls-key`, or a self-signed cert is
+  generated for `127.0.0.1`/`localhost` (fingerprint logged).
+- **Bearer auth, deny-by-default.** `--token`/`REMUX_GATEWAY_TOKEN` is read-write;
+  optional `--read-token`/`REMUX_GATEWAY_READ_TOKEN` is read-only. Read-only
+  tokens may call the `GET` endpoints, `POST /wait`, and the `/events` stream;
+  mutating routes and the `/stream` socket require the read-write token (`403`
+  otherwise; `401` for an unknown token). Every request is audit-logged
+  (method, path, status, scope, hashed token id, peer, latency — never the raw token).
+
+### REST endpoints
+
+```
+GET    /v1/health                      # liveness (no auth)
+GET    /v1/openapi.json                # OpenAPI 3.1 document (no auth)
+GET    /v1/sessions                    # list
+POST   /v1/sessions                    # create  -> 201 SessionView
+GET    /v1/sessions/{id}               # inspect ({id} = uuid or name)
+DELETE /v1/sessions/{id}               # kill
+PATCH  /v1/sessions/{id}               # rename
+POST   /v1/sessions/{id}/input         # send input ({text}|{bytes_hex}|raw) -> 202
+GET    /v1/sessions/{id}/screen        # current screen as JSON cells (ScreenView)
+GET    /v1/sessions/{id}/scrollback    # ?lines=N
+POST   /v1/sessions/{id}/resize        # {cols, rows}
+POST   /v1/sessions/{id}/wait          # {kind: idle|regex|exit} ?timeout_ms=
+```
+
+### WebSocket channels
+
+- `wss://…/v1/sessions/{id}/stream` — an attachable terminal: **binary** frames
+  carry raw I/O byte-exact (output → client, input → daemon); a **text** frame
+  `{"type":"resize","cols":N,"rows":N}` resizes. Requires read-write scope.
+- `wss://…/v1/sessions/{id}/events` — **structured JSON** lifecycle events
+  (exited/updated/…). Read scope is enough.
+
+WS clients pass the token via `?token=…` (browser-friendly) or the
+`Authorization` header. The published contract is decoupled from the internal
+IPC protocol, so the wire can evolve under `PROTOCOL_VERSION` without breaking
+`/v1`; see `docs/openapi.yaml` and `docs/AGENT_API_PLAN.md`.
 
 ## Configuration
 
