@@ -707,9 +707,25 @@ loses output → corrupted screen. Decide policy: either (a) coalesce to a
   protocol messages. Windowing math (`visible_window`) and line splitting are
   factored into pure, unit-tested helpers. Implemented in
   `crates/remux-cli/src/cmd/attach.rs`.
-- **T6.2 Status / message line.** Brief on-attach hint ("[detach: Ctrl-A d]") and
-  transient messages (control stolen, resize) rendered without corrupting the app
-  (use a saved-cursor + restore, or the bottom line only).
+- **T6.2 Status / message line. — DONE.** A persistent, tmux-style status line is
+  drawn on the bottom physical row during a live attach. It is made
+  corruption-proof by (1) **reserving the bottom row**: when the status line is
+  active and the terminal is `>= 2` rows tall, the AttachSession size and every
+  ResizeSession use `content_rows = rows - 1` (cols unchanged), so the app never
+  addresses the reserved row; (2) a **DECSTBM scroll region** of `1..=rows-1`
+  (`\x1b[1;{rows-1}r`) installed on the local terminal so streamed scrolling
+  stays above the bar; and (3) a **repaint after every output chunk** (and on
+  resize / redraw / scroll-exit / control-lost / state-snapshot) using
+  save-cursor → goto bottom row → reverse-video bar (padded/truncated to `cols`)
+  → restore-cursor (`\x1b7 … \x1b8`), which survives an app `\x1b[2J`. The bar
+  shows the session name, a `[SCROLL]` indicator, and the detach hint. The
+  DECSTBM region reset (`\x1b[r`) is guaranteed on **every** exit path (normal,
+  detach, error) via the `RawModeGuard` Drop. Configurable via
+  `client.status_line` (default `true`) and `remux attach --no-status`. SIGWINCH
+  gracefully handles the `rows < 2` transition (region/bar disabled). The text
+  layout (`format_status_bar`) and helpers (`content_size`, `set_scroll_region`,
+  `status_bar_bytes`) are pure and unit-tested. Implemented in
+  `crates/remux-cli/src/cmd/attach.rs`.
 - **T6.3 `remux attach --read-only`.** Expose the existing `AttachMode::Observer`
   (protocol already supports it) as a CLI flag for safe shoulder-surfing / agent
   monitoring.
@@ -727,7 +743,8 @@ loses output → corrupted screen. Decide policy: either (a) coalesce to a
 ### 8.2 Definition of Done
 
 - [ ] Read-only attach flag works.
-- [ ] Detach hint shown; messages don't corrupt the app screen.
+- [x] Detach hint shown; messages don't corrupt the app screen (T6.2 — persistent
+      status line via reserved scroll-region row).
 - [ ] Detached query answering prevents TUI hangs (tested with a program that
       issues a cursor-position report while detached).
 - [ ] Shell completions generated for bash/zsh/fish.

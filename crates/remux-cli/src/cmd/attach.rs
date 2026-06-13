@@ -1,4 +1,6 @@
 use std::io::{Read as StdRead, Write as StdWrite};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use remux_core::framing::{read_message, write_message};
 use remux_core::terminal::TerminalSnapshot;
@@ -23,12 +25,24 @@ pub async fn run(
     name: String,
     detach_key: &str,
     read_only: bool,
+    status_line: bool,
 ) -> Result<(), RemuxError> {
     let session = parse_selector(&name);
-    let size: TermSize = get_terminal_size();
+    let physical = get_terminal_size();
     let client_id = ClientId::new();
     let prefix_byte = parse_detach_byte(detach_key);
     let prefix_label = human_prefix_name(detach_key);
+    let detach_hint = format!("{prefix_label}-d: detach ");
+
+    // The status line reserves the bottom physical row by shrinking the app's
+    // view to `rows - 1`. It is only active when requested AND the terminal is
+    // tall enough to spare a row. `status_active` tracks the *current* state
+    // (it can flip on SIGWINCH if the terminal shrinks below 2 rows).
+    let mut status_active = status_line && physical.rows >= 2;
+
+    // The size the session/PTY/VT is told about: one row shorter when the
+    // status line is active so the app never addresses the reserved row.
+    let size: TermSize = content_size(physical, status_active);
 
     let mode = if read_only {
         AttachMode::Observer
@@ -65,17 +79,47 @@ pub async fn run(
     // Enter raw terminal mode.
     enable_raw_mode().map_err(|e| RemuxError::IoError(format!("failed to enter raw mode: {e}")))?;
 
-    // Guard to ensure we always exit raw mode.
-    struct RawModeGuard;
+    // Guard to ensure we always exit raw mode AND tear down the DECSTBM scroll
+    // region on every exit path (normal, detach, error, panic). A stuck scroll
+    // region after exit would trap the user's shell prompt in the top region,
+    // so the reset (`\x1b[r`) must be guaranteed. `region_set` is shared with
+    // the loop: it is true whenever a scroll region is currently installed.
+    struct RawModeGuard {
+        region_set: Arc<AtomicBool>,
+    }
     impl Drop for RawModeGuard {
         fn drop(&mut self) {
+            if self.region_set.load(Ordering::SeqCst) {
+                // Reset the scroll region, then move to the bottom row and clear
+                // it so the status bar doesn't linger above the shell prompt.
+                let rows = get_terminal_size().rows.max(1);
+                let mut teardown = Vec::new();
+                teardown.extend_from_slice(b"\x1b[r");
+                let _ = write!(
+                    &mut teardown as &mut Vec<u8>,
+                    "\x1b[{rows};1H\x1b[0m\x1b[2K"
+                );
+                let _ = write_to_stdout(&teardown);
+            }
             let _ = disable_raw_mode();
         }
     }
-    let _guard = RawModeGuard;
+    let region_set = Arc::new(AtomicBool::new(false));
+    let _guard = RawModeGuard {
+        region_set: region_set.clone(),
+    };
 
-    // One-line detach hint so the user knows how to get out.
-    eprint!("[detached with {prefix_label}-d]\r\n");
+    // When the status line is active, reserve the bottom row by setting a
+    // DECSTBM scroll region of `1..=rows-1` on the LOCAL terminal so streamed
+    // scrolling stays in the top region and leaves the bottom row alone.
+    if status_active {
+        let _ = write_to_stdout(&set_scroll_region(physical.rows));
+        region_set.store(true, Ordering::SeqCst);
+    } else {
+        // One-line detach hint so the user knows how to get out (when there is
+        // no persistent bar to show it).
+        eprint!("[detached with {prefix_label}-d]\r\n");
+    }
 
     // Write any scrollback data to stdout (history first), then repaint the
     // current screen from the VT snapshot on top of it.
@@ -102,6 +146,15 @@ pub async fn run(
         let painted = crate::render_snapshot::paint_snapshot(&snapshot);
         write_to_stdout(&painted)?;
         last_snapshot = Some(snapshot);
+    }
+
+    // Helper closure-like macro for drawing the status bar at the current size.
+    // We recompute the physical size each draw so SIGWINCH races can't paint a
+    // stale row position.
+    if status_active {
+        let phys = get_terminal_size();
+        let bar = status_bar_bytes(&session_name, false, &detach_hint, phys.cols, phys.rows);
+        let _ = write_to_stdout(&bar);
     }
 
     // Split the UnixStream for concurrent reading and writing.
@@ -171,6 +224,15 @@ pub async fn run(
                             if quit {
                                 exit_scroll_mode(&last_snapshot);
                                 scroll = None;
+                                // Back in LIVE mode: the snapshot repaint covers
+                                // the content rows; restore the status bar.
+                                if status_active {
+                                    let phys = get_terminal_size();
+                                    let bar = status_bar_bytes(
+                                        &session_name, false, &detach_hint, phys.cols, phys.rows,
+                                    );
+                                    let _ = write_to_stdout(&bar);
+                                }
                             } else {
                                 let (rows, cols) = scroll_dimensions();
                                 let view = line_buffer.view_lines();
@@ -213,6 +275,15 @@ pub async fn run(
                                 let painted = crate::render_snapshot::paint_snapshot(snap);
                                 let _ = write_to_stdout(&painted);
                             }
+                            // The full repaint above covers the content rows;
+                            // restore the status bar on the reserved row.
+                            if status_active {
+                                let phys = get_terminal_size();
+                                let bar = status_bar_bytes(
+                                    &session_name, false, &detach_hint, phys.cols, phys.rows,
+                                );
+                                let _ = write_to_stdout(&bar);
+                            }
                         }
 
                         if do_scroll {
@@ -244,13 +315,36 @@ pub async fn run(
             }
             // Handle terminal resize out-of-band via SIGWINCH.
             _ = sigwinch.recv() => {
-                let new_size = get_terminal_size();
+                let phys = get_terminal_size();
+                // Recompute whether the status line can be active at the new
+                // size: it may flip off if the terminal shrank below 2 rows, or
+                // back on if it grew. Re-set / tear down the DECSTBM region to
+                // match before resizing the session.
+                let want_active = status_line && phys.rows >= 2;
+                if want_active && !status_active {
+                    // Status line turning on: install the region.
+                    let _ = write_to_stdout(&set_scroll_region(phys.rows));
+                    region_set.store(true, Ordering::SeqCst);
+                } else if want_active {
+                    // Still on, possibly new height: re-set the region.
+                    let _ = write_to_stdout(&set_scroll_region(phys.rows));
+                } else if status_active {
+                    // Status line turning off (terminal too short): reset the
+                    // region so the whole screen is usable again.
+                    let _ = write_to_stdout(b"\x1b[r");
+                    region_set.store(false, Ordering::SeqCst);
+                }
+                status_active = want_active;
+
+                // Resize the session to the content size (one row shorter while
+                // the status line is active so the app never paints the bar row).
                 let resize_req = Request::ResizeSession {
                     session: session_for_resize.clone(),
-                    size: new_size,
+                    size: content_size(phys, status_active),
                     client_id: client_id.clone(),
                 };
                 let _ = write_message(&mut daemon_writer, &resize_req).await;
+
                 // If scrolling, re-render the view at the new terminal size.
                 if let Some((_keys, offset)) = scroll.as_mut() {
                     let (rows, cols) = scroll_dimensions();
@@ -260,6 +354,12 @@ pub async fn run(
                     *offset = off;
                     let painted = render_scroll_view(&view, off, rows, cols);
                     let _ = write_to_stdout(&painted);
+                } else if status_active {
+                    // LIVE mode: repaint the bar at the new size/position.
+                    let bar = status_bar_bytes(
+                        &session_name, false, &detach_hint, phys.cols, phys.rows,
+                    );
+                    let _ = write_to_stdout(&bar);
                 }
             }
             // Handle daemon events (output from the session)
@@ -278,6 +378,22 @@ pub async fn run(
                                 // exit / when scrolling back to the bottom.
                                 if scroll.is_none() {
                                     let _ = write_to_stdout(&data);
+                                    // Repaint the status bar after every live
+                                    // output chunk: an app `\x1b[2J` or scroll
+                                    // can clobber the reserved row, and the
+                                    // DECSTBM region only protects against
+                                    // streamed scrolling, not erase-display.
+                                    if status_active {
+                                        let phys = get_terminal_size();
+                                        let bar = status_bar_bytes(
+                                            &session_name,
+                                            false,
+                                            &detach_hint,
+                                            phys.cols,
+                                            phys.rows,
+                                        );
+                                        let _ = write_to_stdout(&bar);
+                                    }
                                 }
                             }
                             Event::SessionExited { exit_code, .. } => {
@@ -293,11 +409,25 @@ pub async fn run(
                             }
                             Event::ControlLost { session: _ } => {
                                 let _ = write_to_stdout(b"\r\n[session control taken by another client]\r\n");
+                                if status_active && scroll.is_none() {
+                                    let phys = get_terminal_size();
+                                    let bar = status_bar_bytes(
+                                        &session_name, false, &detach_hint, phys.cols, phys.rows,
+                                    );
+                                    let _ = write_to_stdout(&bar);
+                                }
                             }
                             Event::StateSnapshot { snapshot, .. } => {
                                 let painted = crate::render_snapshot::paint_snapshot(&snapshot);
                                 let _ = write_to_stdout(&painted);
                                 last_snapshot = Some(snapshot);
+                                if status_active && scroll.is_none() {
+                                    let phys = get_terminal_size();
+                                    let bar = status_bar_bytes(
+                                        &session_name, false, &detach_hint, phys.cols, phys.rows,
+                                    );
+                                    let _ = write_to_stdout(&bar);
+                                }
                             }
                             Event::SessionUpdated(_) => {}
                             Event::SessionTerminating { session: _ } => {}
@@ -336,6 +466,89 @@ fn write_to_stdout(data: &[u8]) -> Result<(), RemuxError> {
         .flush()
         .map_err(|e| RemuxError::IoError(format!("stdout flush error: {e}")))?;
     Ok(())
+}
+
+/// The size the session/PTY/VT should be told about. When the status line is
+/// active we shrink the app's view by one row (the reserved bottom physical
+/// row) so the app never addresses it; columns are unchanged. When inactive (or
+/// the terminal is too short) the full physical size is used unchanged.
+fn content_size(physical: TermSize, status_active: bool) -> TermSize {
+    if status_active && physical.rows >= 2 {
+        TermSize {
+            cols: physical.cols,
+            rows: physical.rows - 1,
+        }
+    } else {
+        physical
+    }
+}
+
+/// Bytes that install a DECSTBM scroll region of `1..=rows-1` on the LOCAL
+/// terminal, reserving the bottom physical row for the status bar so streamed
+/// scrolling stays in the top region. Caller guarantees `rows >= 2`.
+fn set_scroll_region(rows: u16) -> Vec<u8> {
+    let bottom = rows.saturating_sub(1).max(1);
+    format!("\x1b[1;{bottom}r").into_bytes()
+}
+
+/// Lay out the status bar TEXT for a terminal `cols` wide. Left segment is the
+/// session name (and a `[SCROLL]` indicator when scrolling); right segment is
+/// the detach hint. The result is exactly `cols` columns wide: the left segment
+/// is padded with spaces up to where the right segment begins, and the whole
+/// thing is truncated to `cols` if it would overflow. Pure and unit-tested.
+fn format_status_bar(session_name: &str, scrolling: bool, detach_hint: &str, cols: u16) -> String {
+    let cols = cols as usize;
+    if cols == 0 {
+        return String::new();
+    }
+    let mut left = format!(" remux: {session_name}");
+    if scrolling {
+        left.push_str("   [SCROLL]");
+    }
+    let right = detach_hint;
+
+    // If both segments fit with at least one space between them, right-align the
+    // hint. Otherwise fall back to the left segment alone, truncated to width.
+    if left.chars().count() + right.chars().count() < cols {
+        let gap = cols - left.chars().count() - right.chars().count();
+        let mut out = String::with_capacity(cols);
+        out.push_str(&left);
+        for _ in 0..gap {
+            out.push(' ');
+        }
+        out.push_str(right);
+        out
+    } else {
+        // Truncate the left segment to fit and pad to full width.
+        let mut out: String = left.chars().take(cols).collect();
+        let pad = cols - out.chars().count();
+        for _ in 0..pad {
+            out.push(' ');
+        }
+        out
+    }
+}
+
+/// Full byte sequence that paints the status bar on the reserved bottom row
+/// without disturbing the app's cursor: save cursor (`\x1b7`), move to
+/// `\x1b[{rows};1H`, write the reverse-video bar (`\x1b[7m … \x1b[0m`) laid out
+/// by [`format_status_bar`] to exactly `cols`, then restore cursor (`\x1b8`).
+fn status_bar_bytes(
+    session_name: &str,
+    scrolling: bool,
+    detach_hint: &str,
+    cols: u16,
+    rows: u16,
+) -> Vec<u8> {
+    let text = format_status_bar(session_name, scrolling, detach_hint, cols);
+    let mut out = Vec::new();
+    // Save cursor, move to the bottom row, reverse video, bar text, reset,
+    // restore cursor. The save/restore keeps the app's cursor intact.
+    let _ = write!(
+        &mut out as &mut Vec<u8>,
+        "\x1b7\x1b[{rows};1H\x1b[7m{text}\x1b[0m\x1b8"
+    );
+    out
 }
 
 /// Parse a session name or ID into a SessionSelector.
@@ -1070,6 +1283,74 @@ mod tests {
         assert!(s.contains("\x1b[7m"));
         assert!(s.contains("-- SCROLL"));
         assert!(s.contains("1-3/3"));
+    }
+
+    // ---- content_size / set_scroll_region ----
+
+    #[test]
+    fn content_size_reserves_a_row_when_active() {
+        let phys = TermSize { cols: 80, rows: 24 };
+        assert_eq!(content_size(phys, true), TermSize { cols: 80, rows: 23 });
+    }
+
+    #[test]
+    fn content_size_full_when_inactive() {
+        let phys = TermSize { cols: 80, rows: 24 };
+        assert_eq!(content_size(phys, false), phys);
+    }
+
+    #[test]
+    fn content_size_full_when_too_short() {
+        // rows < 2: never reserve, even if asked to.
+        let phys = TermSize { cols: 80, rows: 1 };
+        assert_eq!(content_size(phys, true), phys);
+    }
+
+    #[test]
+    fn set_scroll_region_bytes() {
+        // 24 rows -> region 1..=23.
+        assert_eq!(set_scroll_region(24), b"\x1b[1;23r".to_vec());
+        // Degenerate small height clamps the bottom to >= 1.
+        assert_eq!(set_scroll_region(2), b"\x1b[1;1r".to_vec());
+    }
+
+    // ---- format_status_bar (pure text layout) ----
+
+    #[test]
+    fn status_bar_right_aligns_hint_and_fills_width() {
+        let s = format_status_bar("work", false, "Ctrl-a-d: detach ", 40);
+        assert_eq!(s.chars().count(), 40);
+        assert!(s.starts_with(" remux: work"));
+        assert!(s.ends_with("Ctrl-a-d: detach "));
+    }
+
+    #[test]
+    fn status_bar_includes_scroll_indicator() {
+        let s = format_status_bar("work", true, "x", 40);
+        assert!(s.contains("[SCROLL]"));
+        assert_eq!(s.chars().count(), 40);
+    }
+
+    #[test]
+    fn status_bar_truncates_when_too_narrow() {
+        // Width too small to fit both segments: left segment truncated/padded
+        // to exactly `cols`, hint dropped.
+        let s = format_status_bar("a-very-long-session-name", false, "Ctrl-a-d: detach ", 10);
+        assert_eq!(s.chars().count(), 10);
+    }
+
+    #[test]
+    fn status_bar_zero_cols_is_empty() {
+        assert_eq!(format_status_bar("x", false, "y", 0), "");
+    }
+
+    #[test]
+    fn status_bar_bytes_wraps_with_cursor_save_restore() {
+        let b = status_bar_bytes("work", false, "h", 20, 24);
+        let s = String::from_utf8_lossy(&b);
+        // Save cursor, goto row 24 col 1, reverse video, reset, restore cursor.
+        assert!(s.starts_with("\x1b7\x1b[24;1H\x1b[7m"));
+        assert!(s.ends_with("\x1b[0m\x1b8"));
     }
 
     #[test]

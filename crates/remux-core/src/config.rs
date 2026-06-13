@@ -98,6 +98,10 @@ pub struct ClientConfig {
     pub default_shell: String,
     #[serde(default = "default_detach_key")]
     pub detach_key: String,
+    /// Show a persistent status line at the bottom of the screen during a live
+    /// attach (tmux-style). Disable per-attach with `--no-status`.
+    #[serde(default = "default_status_line")]
+    pub status_line: bool,
 }
 
 fn default_shell() -> String {
@@ -108,11 +112,16 @@ fn default_detach_key() -> String {
     "ctrl-a".to_string()
 }
 
+fn default_status_line() -> bool {
+    true
+}
+
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             default_shell: default_shell(),
             detach_key: default_detach_key(),
+            status_line: default_status_line(),
         }
     }
 }
@@ -133,6 +142,7 @@ mod tests {
         assert!(!config.daemon.persist_scrollback);
         assert_eq!(config.daemon.cleanup_exited_after_hours, 168);
         assert_eq!(config.client.detach_key, "ctrl-a");
+        assert!(config.client.status_line);
     }
 
     #[test]
@@ -145,12 +155,14 @@ persist_scrollback = true
 [client]
 default_shell = "/bin/zsh"
 detach_key = "ctrl-a"
+status_line = false
 "#;
         let config = Config::from_toml_str(toml).expect("parse");
         assert_eq!(config.daemon.max_scrollback_lines, 5000);
         assert!(config.daemon.persist_scrollback);
         assert_eq!(config.client.default_shell, "/bin/zsh");
         assert_eq!(config.client.detach_key, "ctrl-a");
+        assert!(!config.client.status_line);
         // Data section should retain defaults since not specified
         assert_eq!(config.data.dir, dirs::data_dir().unwrap().join("remux"));
     }
@@ -160,6 +172,7 @@ detach_key = "ctrl-a"
         let config = Config::from_toml_str("").expect("parse empty");
         assert_eq!(config.daemon.max_scrollback_lines, 20_000);
         assert_eq!(config.client.detach_key, "ctrl-a");
+        assert!(config.client.status_line);
     }
 
     #[test]

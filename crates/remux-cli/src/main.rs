@@ -58,6 +58,9 @@ enum Commands {
         /// Attach read-only (Observer): render output but never forward input
         #[arg(long)]
         read_only: bool,
+        /// Disable the persistent bottom status line for this attach
+        #[arg(long)]
+        no_status: bool,
     },
     /// Launch the interactive session-manager UI
     #[command(visible_alias = "i")]
@@ -237,8 +240,20 @@ async fn main() {
             command,
         } => cmd::new::run(&mut client, name, command, json).await,
         Commands::Ls { json, preview } => cmd::ls::run(&mut client, json, preview).await,
-        Commands::Attach { name, read_only } => {
-            cmd::attach::run(client, name, &config.client.detach_key, read_only).await
+        Commands::Attach {
+            name,
+            read_only,
+            no_status,
+        } => {
+            let status_line = config.client.status_line && !no_status;
+            cmd::attach::run(
+                client,
+                name,
+                &config.client.detach_key,
+                read_only,
+                status_line,
+            )
+            .await
         }
         Commands::Ui => match remux_tui::run(socket_path.clone()).await {
             Ok(()) => Ok(()),
