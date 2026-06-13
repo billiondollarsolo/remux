@@ -6,5 +6,6 @@ members = [
     "crates/remux-tui",
     "crates/remux-testkit",
     "crates/remux-gateway",
+    "crates/remux-control-plane",
 ]
 resolver = "2"

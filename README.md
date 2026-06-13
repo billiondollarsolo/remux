@@ -346,6 +346,57 @@ collaboration, recording, or multi-session layouts.
 - xterm.js loads from a CDN (jsdelivr); vendoring it for fully offline /
   air-gapped use is a follow-up.
 
+## Control plane (fleet federation)
+
+`remux-control-plane` is a **separate TLS service** that federates over many
+gateways — one pane across a fleet for both humans and agents. It is the AW6
+control-plane core (`spec.md` §10, `docs/AGENT_API_PLAN.md` §8).
+
+```sh
+remux-control-plane                              # TLS on 127.0.0.1:9443; self-signed cert + admin/register tokens (logged)
+remux-control-plane --listen 0.0.0.0:9443 \
+  --token "$ADMIN_TOKEN" --register-token "$REGISTER_TOKEN" \
+  --tls-cert cert.pem --tls-key key.pem
+```
+
+**Security model.** The daemon stays **local-only** (Unix socket, no network
+listener). Gateways **register outbound** to the control plane — the control
+plane never dials a host it was not first told about, so no inbound listener is
+added anywhere new. Two bearer tokens, deny-by-default, constant-time compare:
+the **admin** token guards the fleet API; the lower-privilege **register** token
+is what each gateway carries to join. Every request is audit-logged (method,
+path, status, token kind, peer, latency — never raw tokens). v1 **trusts
+self-signed gateway certs** (`--gateway-tls-insecure`, default `true`, logged as
+a warning); gateway-cert pinning / CA trust is a hardening follow-up.
+
+### Endpoints
+
+```
+GET    /cp/v1/health                   # liveness (no auth)
+POST   /cp/v1/register                 # gateway joins: {name,url,labels,token,ttl_secs?}  (register token)
+POST   /cp/v1/heartbeat                # refresh last_seen: {name}                          (register token)
+DELETE /cp/v1/hosts/{name}             # deregister                                         (register token)
+GET    /cp/v1/hosts                    # list {name,url,labels,last_seen,healthy}           (admin token)
+GET    /cp/v1/sessions[?label=k=v]…    # concurrent fan-out of /v1/sessions, tagged by host (admin token)
+POST   /cp/v1/resolve                  # intent routing: {labels,command?,reuse_name?}      (admin token)
+```
+
+- **Registry** — an in-memory map keyed by host name; registration is an
+  idempotent upsert that sets `last_seen=now`. A host is `healthy` while
+  `now - last_seen < ttl`; expired hosts are excluded from fan-out.
+- **Federated sessions** — fans out `GET /v1/sessions` concurrently to every
+  healthy host matching **all** `label=k=v` selectors, aggregating the results
+  tagged by host. An unreachable or erroring host is reported per-host
+  (`{ host, url, ok:false, error, sessions:[] }`) and **never** fails the whole
+  query.
+- **Resolve** — picks the first healthy host matching all labels
+  (deterministic), returns an existing session of `reuse_name` if one is live,
+  else creates one via that gateway's `POST /v1/sessions`, responding
+  `{ host, gateway_url, session_id, name, created }`.
+
+Gateway `--register` auto-registration, the `remux open` CLI front-end, and
+RBAC/OIDC/mTLS with cross-host migration are the explicitly-deferred next steps.
+
 ## Configuration
 
 Config is loaded from `~/.config/remux/config.toml` (or the path given to

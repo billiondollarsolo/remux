@@ -838,8 +838,44 @@ the API, not to *be* the product.
 > RBAC — `remuxd` stays Unix-socket-only. See
 > `crates/remux-core/src/config.rs` (`FleetConfig`/`FleetHost`),
 > `crates/remux-cli/src/cmd/fleet.rs`, and `crates/remux-cli/tests/fleet.rs`.
-> The federated control plane below (§8.1's registry *service*, §8.1's intent
-> routing, §8.4) remains deferred.
+> **Control-plane CORE update (SHIPPED):** the federated **control-plane
+> service** is now built as `crates/remux-control-plane` (binary
+> `remux-control-plane`), a TLS axum service that federates over gateways:
+> - **Outbound host registry** (in-memory `Arc<RwLock<HashMap<String,
+>   HostEntry>>`). Gateways register **themselves** (outbound) via
+>   `POST /cp/v1/register` (register-token, idempotent upsert by name);
+>   `POST /cp/v1/heartbeat` refreshes `last_seen`; `DELETE /cp/v1/hosts/{name}`
+>   deregisters; `GET /cp/v1/hosts` (admin-token) lists `{name,url,labels,
+>   last_seen,healthy}` with `healthy = now-last_seen < ttl`. The daemon keeps
+>   its no-inbound-listener invariant.
+> - **Federated fleet API** (admin-token): `GET /cp/v1/sessions[?label=k=v]…`
+>   does a server-side **concurrent fan-out** (`tokio::task::JoinSet`) of
+>   `GET /v1/sessions` to all healthy hosts matching ALL labels, tagging each
+>   session with its host; unreachable/erroring hosts are reported per-host
+>   (`ok:false` + `error`), never fatal.
+> - **Intent routing v1**: `POST /cp/v1/resolve {labels, command?, reuse_name?}`
+>   picks the first healthy host matching all labels (deterministic, by name),
+>   reuses a same-named session if present, else creates one via the gateway's
+>   `POST /v1/sessions`, returning `{host, gateway_url, session_id, name,
+>   created}`.
+> - **`GatewayClient`** (reqwest) wraps a gateway base URL + bearer token with
+>   bounded per-gateway timeouts. v1 trusts **self-signed** gateway certs
+>   (`--gateway-tls-insecure`, default `true`, logged as a warning) — gateway
+>   cert **pinning / CA trust** is the hardening follow-up.
+> - **Bootstrap/security**: TLS always on (self-signed for loopback or operator
+>   PEM); deny-by-default bearer auth with constant-time compare and **two**
+>   token kinds (admin token for the fleet API, register token for the
+>   registration surface); per-request audit logging (method, path, status,
+>   token-kind, peer, latency — never raw tokens). Proven by a multi-service
+>   TLS e2e test (two daemons + two in-process gateways + the control plane:
+>   `crates/remux-control-plane/tests/federation_e2e.rs`).
+>
+> **Still DEFERRED (the explicit NEXT steps):** gateway `--register`
+> auto-registration (today a gateway is registered by an external caller / the
+> e2e harness), the `remux open` CLI front-end for intent routing, **RBAC / OIDC
+> / mTLS** and principal-scoped tokens, **gateway-cert pinning / CA trust**, and
+> **cross-host session migration** + agent-ownership arbitration. §8.4 below is
+> updated accordingly.
 
 **Goal:** Sketch the layer that turns "one daemon, one host" into "one pane for
 humans **and** agents across a fleet." This is `spec.md` §10. We **design** it
@@ -886,17 +922,25 @@ view because every session is already introspectable as data.
 
 ### 8.4 Explicitly deferred
 
-The **client-side discovery slice has shipped** (see the §8 status note): static
-host registry, `fleet hosts`/`fleet ls`/`fleet attach`, concurrent SSH fan-out,
-label filtering, per-host error isolation, `--json`. What remains **future
-work**:
+The **client-side discovery slice** shipped first (static host registry,
+`fleet hosts`/`fleet ls`/`fleet attach`, concurrent SSH fan-out), and the
+**control-plane CORE** has now shipped too (see the §8 status note):
+`remux-control-plane` with the **outbound** host-registry service
+(register/heartbeat/deregister/list, health-tracked by TTL), the **federated
+fleet API** (`GET /cp/v1/sessions` concurrent gateway fan-out + label filtering +
+per-host error isolation), and **intent routing v1** (`POST /cp/v1/resolve`).
+What remains **future work**:
 
-- the control-plane **registry service** (gateway→control-plane registration,
-  health, a cached fleet index) — today the registry is a static client-side
-  config list, queried live per command;
-- **RBAC**, multi-tenant isolation, and principal-scoped tokens fleet-wide;
-- **intent-based routing** (`remux open --project api --env dev` resolving
-  intent → host → existing-or-new session);
+- **gateway auto-registration**: a gateway `--register <cp-url>` flag that has the
+  gateway register itself outbound on startup + heartbeat on a timer (today an
+  external caller performs the `POST /cp/v1/register`);
+- the **`remux open` CLI** front-end (`remux open --project api --env dev`) that
+  drives `POST /cp/v1/resolve` and then routes the caller to the session;
+- **RBAC / OIDC / mTLS**, multi-tenant isolation, and principal-scoped tokens
+  fleet-wide (v1 ships two coarse static tokens: admin + register);
+- **gateway-cert pinning / CA trust** (v1 trusts self-signed gateway certs via
+  `--gateway-tls-insecure`, default on);
+- a **cached fleet index** (today fan-out is live per request);
 - **cross-host session migration** and agent-ownership arbitration.
 
 The shipped slice is forward-compatible with all of the above: the registry
