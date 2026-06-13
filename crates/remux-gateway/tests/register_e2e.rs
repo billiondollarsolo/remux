@@ -115,7 +115,7 @@ async fn gateway_auto_registers_and_is_reachable() {
         labels,
         gateway_token: TEST_TOKEN.to_string(),
         ttl_secs: 2,
-        tls_insecure: true,
+        verification: remux_gateway::peer_tls::PeerVerification::Insecure,
     };
     remux_gateway::register::spawn(cfg, shutdown_rx);
 

@@ -5,16 +5,20 @@
 //! DTOs (`SessionView`, `CreateSessionBody`) so the federation layer speaks the
 //! exact same contract as the gateway itself.
 //!
-//! **TLS-trust posture (v1).** Gateways default to **self-signed** certificates,
-//! so the control plane must be able to trust them to call their `/v1` API. v1
-//! sets `--gateway-tls-insecure` (default **true**): the outbound client accepts
-//! self-signed/invalid gateway certs. This is logged as a warning at startup —
-//! certificate **pinning / CA trust** is the hardening follow-up. Per-gateway
-//! request timeouts are bounded so one slow/hung gateway cannot stall fan-out.
+//! **TLS-trust posture (Phase C — secure by default).** The control plane
+//! verifies each gateway's certificate against system roots by default. To call a
+//! self-signed gateway, an operator pins its leaf with `--gateway-pin <SHA256>`
+//! (no CA needed) or trusts a CA bundle with `--gateway-ca <PEM>`.
+//! `--gateway-tls-insecure` (default **false**) remains an explicit, loudly-logged
+//! dev-only opt-out. A wrong pin / CA mismatch surfaces as a TLS error on that
+//! gateway's fan-out row (`ok:false`), never a panic. Per-gateway request timeouts
+//! are bounded so one slow/hung gateway cannot stall fan-out. See
+//! [`remux_gateway::peer_tls`].
 
 use std::time::Duration;
 
 use remux_gateway::dto::{CreateSessionBody, SessionView};
+use remux_gateway::peer_tls::{self, PeerVerification};
 
 /// The default per-request timeout for an outbound gateway call. Bounded so a
 /// hung gateway is reported as an error instead of stalling the fan-out.
@@ -42,18 +46,16 @@ pub struct GatewayClient {
 
 impl GatewayClient {
     /// Build a client for `base_url` (e.g. `https://host:8443`) authenticating
-    /// with `token`. `tls_insecure` accepts self-signed gateway certs (v1
-    /// default); `timeout` bounds every request.
+    /// with `token`. `verification` selects the gateway TLS-trust posture
+    /// (system roots / CA bundle / SHA-256 leaf pin / dev-insecure);
+    /// `timeout` bounds every request.
     pub fn new(
         base_url: impl Into<String>,
         token: impl Into<String>,
-        tls_insecure: bool,
+        verification: &PeerVerification,
         timeout: Duration,
     ) -> Result<Self, GatewayError> {
-        let http = reqwest::Client::builder()
-            .danger_accept_invalid_certs(tls_insecure)
-            .timeout(timeout)
-            .build()
+        let http = peer_tls::build_client(verification, timeout, "--gateway-ca")
             .map_err(|e| GatewayError::Request(e.to_string()))?;
         Ok(Self {
             http,
@@ -129,8 +131,14 @@ mod tests {
 
     #[test]
     fn base_url_trailing_slash_trimmed() {
-        let c =
-            GatewayClient::new("https://h:8443/", "tok", true, DEFAULT_GATEWAY_TIMEOUT).unwrap();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let c = GatewayClient::new(
+            "https://h:8443/",
+            "tok",
+            &PeerVerification::Insecure,
+            DEFAULT_GATEWAY_TIMEOUT,
+        )
+        .unwrap();
         assert_eq!(c.base_url, "https://h:8443");
     }
 

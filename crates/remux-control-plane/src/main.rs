@@ -14,10 +14,13 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use remux_authz::MtlsIdentities;
 use remux_control_plane::app::AppState;
 use remux_control_plane::auth::AuthConfig;
 use remux_control_plane::tls::TlsMaterial;
 use remux_gateway::jwt_service::{JwtAuth, JwtSettings};
+use remux_gateway::mtls::{MtlsAcceptor, MtlsConfig, MtlsMode};
+use remux_gateway::peer_tls::PeerVerification;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -93,12 +96,48 @@ struct Cli {
     #[arg(long)]
     tls_key: Option<PathBuf>,
 
-    /// Accept self-signed / invalid certificates when calling registered
-    /// gateways. Defaults to **true** for v1 (gateways are self-signed by
-    /// default); set `--gateway-tls-insecure=false` once gateways present a
-    /// trusted/pinned cert.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    /// PEM CA bundle to trust for gateways' TLS certs (Phase C). A gateway's own
+    /// self-signed cert may be used here as a CA root. Preferred over
+    /// `--gateway-pin`.
+    #[arg(long, value_name = "PEM")]
+    gateway_ca: Option<PathBuf>,
+
+    /// SHA-256 fingerprint (hex, `:`/whitespace ignored) of a gateway LEAF cert to
+    /// pin (Phase C, repeatable). Accepts ONLY a matching leaf — no CA needed,
+    /// ideal for self-signed gateways. A non-matching gateway fans out as
+    /// `ok:false` (TLS error), never a panic.
+    #[arg(long = "gateway-pin", value_name = "SHA256")]
+    gateway_pins: Vec<String>,
+
+    /// DEV ONLY: accept ANY gateway TLS cert. Defaults to `false` (secure):
+    /// without a CA/pin, gateways are verified against system roots and a
+    /// self-signed cert fails. Loudly logged.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     gateway_tls_insecure: bool,
+
+    // --- Phase C: mTLS client-certificate authentication (inbound) ---
+    /// Enable mTLS: request + verify client certificates against this PEM CA
+    /// bundle. A verified client cert's identity becomes the authenticated
+    /// principal (cert identity wins over a bearer).
+    #[arg(long, value_name = "PEM")]
+    client_ca: Option<PathBuf>,
+
+    /// mTLS enforcement mode: `optional` (use a valid client cert if presented,
+    /// else fall back to bearer auth) or `require` (a valid client cert is
+    /// mandatory). Default `optional`. Ignored unless `--client-ca` is set.
+    #[arg(long, default_value = "optional")]
+    mtls_mode: String,
+
+    /// TOML file mapping client-cert identities (CN or first SAN) to roles
+    /// (`[[identities]] subject="…" roles=[…]`). Unmapped valid certs get
+    /// `--mtls-default-roles`.
+    #[arg(long, value_name = "TOML")]
+    mtls_identities: Option<PathBuf>,
+
+    /// Comma-separated default roles for a valid-but-unmapped client cert. Default
+    /// none → such a cert authenticates but is `403` on every route until mapped.
+    #[arg(long, value_name = "r1,r2", default_value = "")]
+    mtls_default_roles: String,
 }
 
 /// Generate a random, URL-safe bearer token (jupyter-style hex).
@@ -183,21 +222,72 @@ async fn run(cli: Cli) -> Result<(), String> {
     } else {
         tracing::info!(fingerprint = %tls.fingerprint, "loaded operator-provided TLS cert");
     }
-    let rustls_config = tls.into_rustls_config().await?;
+    // Phase C: optional mTLS (inbound client-certificate auth). Build the mTLS
+    // acceptor when `--client-ca` is set; otherwise serve plain TLS as before.
+    let mtls = match cli.client_ca.as_deref() {
+        Some(ca_path) => {
+            let mode = MtlsMode::parse(&cli.mtls_mode)?;
+            let default_roles: Vec<String> = cli
+                .mtls_default_roles
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            let identities = match cli.mtls_identities.as_deref() {
+                Some(path) => remux_authz::load_mtls_identities(path, default_roles.clone())
+                    .map_err(|e| format!("mtls identities: {e}"))?,
+                None => MtlsIdentities::new([], default_roles.clone()),
+            };
+            let cfg = MtlsConfig::from_paths(ca_path, mode, identities)
+                .map_err(|e| format!("mtls setup: {e}"))?;
+            let rustls = cfg
+                .server_config(&tls.cert_pem, &tls.key_pem)
+                .map_err(|e| format!("mtls server config: {e}"))?;
+            tracing::info!(
+                mode = %mode,
+                client_ca = %ca_path.display(),
+                identities = cfg.identity_count(),
+                "mTLS client-certificate auth enabled (verified cert identity wins over bearer)"
+            );
+            Some(MtlsAcceptor::new(rustls, cfg))
+        }
+        None => None,
+    };
+    let rustls_config = if mtls.is_none() {
+        Some(tls.into_rustls_config().await?)
+    } else {
+        None
+    };
+
+    // Resolve the outbound gateway TLS-verification posture (secure by default).
+    let gateway_ca_pem = match cli.gateway_ca.as_deref() {
+        Some(path) => Some(
+            std::fs::read(path)
+                .map_err(|e| format!("failed to read --gateway-ca {}: {e}", path.display()))?,
+        ),
+        None => None,
+    };
+    let (gateway_verification, gw_vlabel) = PeerVerification::resolve(
+        cli.gateway_tls_insecure,
+        gateway_ca_pem,
+        cli.gateway_pins.clone(),
+    );
 
     let (listener, addr) = remux_control_plane::server::bind_listener(cli.listen)
         .map_err(|e| format!("failed to bind {}: {e}", cli.listen))?;
 
     tracing::info!(
         listen = %addr,
-        gateway_tls_insecure = cli.gateway_tls_insecure,
+        gateway_tls_verification = gw_vlabel,
         "remux-control-plane serving the /cp/v1 fleet API over TLS"
     );
 
     if cli.gateway_tls_insecure {
         tracing::warn!(
-            "--gateway-tls-insecure is TRUE (v1 default): outbound calls to gateways accept \
-             self-signed/invalid certs. Gateway-cert pinning / CA trust is a hardening follow-up."
+            "--gateway-tls-insecure is TRUE (dev only): outbound calls to gateways accept \
+             ANY cert. For production, pin gateways with --gateway-pin or trust a CA with \
+             --gateway-ca (secure by default)."
         );
     }
 
@@ -229,9 +319,16 @@ async fn run(cli: Cli) -> Result<(), String> {
         tracing::info!("auth-config file loaded (principal-shaped tokens + custom roles)");
     }
 
-    let state = AppState::new(auth).with_gateway_tls_insecure(cli.gateway_tls_insecure);
+    let state = AppState::new(auth).with_gateway_verification(gateway_verification);
 
-    remux_control_plane::server::serve(listener, rustls_config, state)
-        .await
-        .map_err(|e| format!("server error: {e}"))
+    match (mtls, rustls_config) {
+        (Some(acceptor), _) => {
+            remux_control_plane::server::serve_mtls(listener, acceptor, state).await
+        }
+        (None, Some(rustls_config)) => {
+            remux_control_plane::server::serve(listener, rustls_config, state).await
+        }
+        (None, None) => unreachable!("rustls_config is Some whenever mTLS is off"),
+    }
+    .map_err(|e| format!("server error: {e}"))
 }

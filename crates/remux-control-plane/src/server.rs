@@ -6,6 +6,7 @@
 use std::net::{SocketAddr, TcpListener};
 
 use axum_server::tls_rustls::RustlsConfig;
+use remux_gateway::mtls::MtlsAcceptor;
 
 use crate::app::{router, AppState};
 
@@ -28,6 +29,22 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let app = router(state);
     axum_server::from_tcp_rustls(listener, tls)
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+}
+
+/// Serve the control plane over **mTLS** on an already-bound `TcpListener`, using
+/// the gateway's [`MtlsAcceptor`] so each connection's verified client-cert
+/// identity is injected as an `Option<MtlsPrincipal>` extension (the CP auth
+/// middleware prefers it over a bearer). Drives `axum-server` to completion.
+pub async fn serve_mtls(
+    listener: TcpListener,
+    acceptor: MtlsAcceptor,
+    state: AppState,
+) -> std::io::Result<()> {
+    let app = router(state);
+    axum_server::from_tcp(listener)
+        .acceptor(acceptor)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
 }

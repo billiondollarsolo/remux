@@ -10,7 +10,9 @@
 //!   grows an inbound network listener.
 //! - [`client`] — [`GatewayClient`], a reqwest wrapper over one gateway's public
 //!   `/v1` API, reusing the gateway's shared DTOs (`SessionView`,
-//!   `CreateSessionBody`). v1 trusts self-signed gateway certs (`--gateway-tls-insecure`).
+//!   `CreateSessionBody`). Gateway TLS is verified **secure by default** (system
+//!   roots; or `--gateway-ca` / `--gateway-pin`; `--gateway-tls-insecure` is a
+//!   dev-only opt-out) via [`remux_gateway::peer_tls`].
 //! - [`app`] — the `/cp/v1` axum router: the registry endpoints (register/
 //!   heartbeat/deregister/list), the federated fleet API (concurrent fan-out of
 //!   `GET /v1/sessions`), and intent-based session [`resolve`]ing.
@@ -20,9 +22,10 @@
 //! - [`tls`] — rustls material (operator PEM or self-signed for loopback).
 //! - [`server`] — serving over TLS via `axum-server`.
 //!
-//! **Deferred (NEXT steps, not in this crate):** RBAC/OIDC/mTLS, gateway-cert
-//! pinning / CA trust, cross-host session migration, and the `remux open` CLI +
-//! gateway `--register` auto-registration.
+//! Auth hardening is complete: RBAC + JWT/OIDC + **mTLS** (`--client-ca`,
+//! `--mtls-mode`, `--mtls-identities`) + **gateway-cert pinning / CA trust**
+//! (secure by default). **Deferred (future work):** cross-host session migration,
+//! client-cert revocation (CRL/OCSP), and multi-tenant policy.
 
 pub mod app;
 pub mod auth;
@@ -36,5 +39,5 @@ pub use auth::AuthConfig;
 pub use client::GatewayClient;
 pub use registry::{HostEntry, HostView, Registry};
 pub use remux_authz::{Permission, Principal};
-pub use server::{bind_listener, serve};
+pub use server::{bind_listener, serve, serve_mtls};
 pub use tls::TlsMaterial;

@@ -29,6 +29,7 @@ use crate::dto::{
     SessionView, WaitBody, WaitResult,
 };
 use crate::error::ApiError;
+use crate::mtls::MtlsPrincipal;
 use crate::selector::parse_selector;
 use crate::DaemonConn;
 
@@ -222,16 +223,29 @@ async fn enforce_permission(
     mut request: Request,
     next: Next,
 ) -> Response {
+    // Precedence: a verified client certificate (mTLS) is the authenticated
+    // principal — cert identity WINS over any bearer presented in the same
+    // request. The custom acceptor injects `Option<MtlsPrincipal>` per
+    // connection (present only when a valid client cert was verified).
+    let mtls_principal = request
+        .extensions()
+        .get::<Option<MtlsPrincipal>>()
+        .and_then(|o| o.clone());
+
     let presented = extract_token(request.headers(), request.uri().query());
-    let (principal, method): (Principal, &'static str) = match presented
-        .as_deref()
-        .and_then(|t| state.auth.authenticate(t))
-    {
-        Some((p, m)) => (p, m.as_str()),
-        None => {
-            let body =
-                json!({ "error": "missing or invalid bearer token", "kind": "unauthorized" });
-            return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+    let (principal, method): (Principal, &'static str) = if let Some(mp) = mtls_principal {
+        (mp.0, "mtls")
+    } else {
+        match presented
+            .as_deref()
+            .and_then(|t| state.auth.authenticate(t))
+        {
+            Some((p, m)) => (p, m.as_str()),
+            None => {
+                let body =
+                    json!({ "error": "missing or invalid bearer token", "kind": "unauthorized" });
+                return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+            }
         }
     };
     if !state.auth.permits(&principal, required) {
@@ -244,8 +258,13 @@ async fn enforce_permission(
         });
         return (StatusCode::FORBIDDEN, Json(body)).into_response();
     }
-    // Stash identity for the audit layer (token never logged in the clear).
-    let token_id = presented.as_deref().map(audit_id_for).unwrap_or_default();
+    // Stash identity for the audit layer (token never logged in the clear). An
+    // mTLS principal has no bearer token; its id is the cert subject.
+    let token_id = if method == "mtls" {
+        format!("cert:{}", principal.subject)
+    } else {
+        presented.as_deref().map(audit_id_for).unwrap_or_default()
+    };
     let ctx = AuthContext {
         subject: principal.subject.clone(),
         roles: principal.roles_display(),

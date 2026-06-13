@@ -777,13 +777,70 @@ static token. Static tokens keep working unchanged.
   `tests/jwt_e2e.rs` (a `fleet-viewer` JWT lists hosts but is `403` on resolve, a
   `fleet-admin` JWT clears the resolve gate, static admin token unaffected).
 
-### 6.4 Deferred to the remaining hardening phase (C)
+### 6.3b Auth hardening Phase C — mTLS + gateway-cert pinning ✅ **SHIPPED**
 
-mTLS + gateway-cert pinning / CA trust (Phase C), per-org/team policy,
-short-lived credentials, and full audit pipelines remain **deferred**. They are
-*additive*: each is simply another way to produce a `remux_authz::Principal`; the
-`Policy`/`permits` decision and the audit shape are unchanged. (`spec.md` §11
-"Fleet: RBAC, audit logs".)
+Auth hardening is now complete: **RBAC + JWT/OIDC + mTLS + cert pinning**. Phase C
+adds two things, both *additive* — each is just another way to produce a
+`remux_authz::Principal` (or to verify a peer's cert), and the `Policy`/`permits`
+decision and the audit shape are unchanged.
+
+**(1) Gateway-cert pinning / CA trust — secure by default.** The two outbound
+client links — control plane → gateway (`GatewayClient`) and gateway → control
+plane (`--register`) — no longer trust self-signed certs blindly. The shared
+`remux_gateway::peer_tls` helper exposes a `PeerVerification` with four modes,
+resolved from flags in priority order:
+- `--gateway-ca <PEM>` / `--register-ca <PEM>` — trust a PEM **CA bundle** for the
+  peer (the peer's own self-signed cert may be used here as a CA root);
+- `--gateway-pin <SHA256>` / `--register-pin <SHA256>` (**repeatable**) — accept
+  ONLY a leaf cert whose **SHA-256 fingerprint** matches (no CA needed; ideal for
+  self-signed peers), via a custom `rustls` `ServerCertVerifier` plugged into
+  reqwest with `use_preconfigured_tls`;
+- *(default)* **system roots** — verify against the OS/webpki store; a self-signed
+  peer fails the handshake with a clear, operator-actionable error;
+- `--gateway-tls-insecure` / `--register-tls-insecure` — now **default `false`**;
+  an explicit, loudly-logged **dev-only** opt-out (accept any cert).
+
+  The insecure-by-default wart is gone. A wrong pin / CA mismatch surfaces as a TLS
+  error (CP fan-out row `ok:false`; register loop retries) — never a panic.
+
+**(2) mTLS client-certificate authentication (gateway + control plane).**
+`--client-ca <PEM>` enables mTLS: the rustls server is built with a
+`WebPkiClientVerifier` against that CA and requests + verifies client certs.
+`--mtls-mode require|optional` (default `optional`): `require` makes a valid client
+cert mandatory (the handshake refuses connections without one); `optional` uses a
+valid cert if presented, else falls back to the existing bearer (token/JWT)
+resolution. A custom `axum-server` acceptor (`remux_gateway::mtls::MtlsAcceptor`,
+reused by both services) completes the handshake, reads `peer_certificates()`,
+extracts the leaf's **CN (or first SAN)** (`x509-parser`), and maps it — via the
+**pure** `remux_authz::MtlsIdentities` helper — to a `Principal`, stashed as an
+`Option<MtlsPrincipal>` request extension. Roles come from `--mtls-identities
+<TOML>` (`[[identities]] subject="…" roles=[…]`); an unmapped-but-valid cert gets
+`--mtls-default-roles <r1,r2>` (default **none** → it authenticates but is `403` on
+every route until an operator maps it). **Precedence:** a verified client cert is
+the authenticated principal — **cert identity WINS** over a bearer presented in the
+same request — and it enforces the **SAME** per-route `Permission`s via `permits()`.
+`/health` + `/openapi.json` stay public. The audit line records
+`auth_method = mtls` with the cert subject + roles.
+
+- **Tested** (rcgen-generated PKI): gateway `tests/mtls_e2e.rs` — operator cert
+  read+write, viewer cert 200-read / 403-write, cert-wins-over-bearer precedence,
+  unmapped valid cert → 403, `optional` no-cert → bearer still works (and no-auth →
+  401), `require` no-cert → connection refused (handshake) + valid cert works;
+  control-plane `tests/mtls_e2e.rs` — fleet-admin cert lists+resolves, fleet-viewer
+  cert 403 on resolve, `require` no-cert refused. Pinning: control-plane
+  `tests/pinning_e2e.rs` (CP pins the gateway's real self-signed leaf → federation
+  works; wrong pin → `ok:false` TLS error, no panic; gateway-cert-as-CA works) and
+  gateway `tests/register_pinning_e2e.rs` (auto-register with the correct CP pin
+  succeeds; a wrong pin fails closed without crashing the gateway; CP-cert-as-CA
+  works). Plus `remux_authz::mtls` + `peer_tls` unit tests.
+
+### 6.4 Deferred beyond Phase C
+
+Auth hardening (RBAC + JWT/OIDC + mTLS + pinning) is complete. Still **deferred**
+as future work: per-org/team multi-tenant policy, short-lived/rotating credentials
+(SPIFFE-style cert rotation), client-cert **revocation (CRL/OCSP)**, and full
+external audit pipelines. They remain *additive* over the shipped model.
+(`spec.md` §11 "Fleet: RBAC, audit logs".)
 
 ### 6.4 Tests
 
@@ -844,9 +901,18 @@ short-lived credentials, and full audit pipelines remain **deferred**. They are
       `permits()` decision and 401/403 semantics. Tested in `remux-authz` unit
       tests, `jwt_service` unit tests, and the gateway + control-plane
       `tests/jwt_e2e.rs`.
-- [x] mTLS + cert-pinning (Phase C) documented as the remaining deferred work
-      (§6.4). It is additive: it produces a `remux_authz::Principal` and reuses the
-      shipped `Policy`/`permits` decision and audit shape unchanged.
+- [x] **mTLS + gateway-cert pinning (Phase C) — SHIPPED** (§6.3b). Gateway-cert
+      pinning / CA trust made the two outbound links **secure by default**
+      (`--gateway-ca`/`--gateway-pin`, `--register-ca`/`--register-pin`;
+      `*-tls-insecure` now defaults `false`, a dev-only opt-out), via
+      `remux_gateway::peer_tls` (custom rustls `ServerCertVerifier` for pins).
+      mTLS client-cert auth (`--client-ca`, `--mtls-mode require|optional`,
+      `--mtls-identities`, `--mtls-default-roles`) extracts the peer leaf's CN/SAN
+      and maps it to a `Principal` via the pure `remux_authz::MtlsIdentities`; the
+      cert identity **wins over a bearer** and enforces the SAME per-route
+      permissions. Tested in `remux_authz`/`peer_tls` unit tests, gateway + CP
+      `tests/mtls_e2e.rs`, and `tests/pinning_e2e.rs` / `tests/register_pinning_e2e.rs`
+      (rcgen PKI). Auth hardening (RBAC + JWT/OIDC + mTLS + pinning) is complete.
 
 ---
 

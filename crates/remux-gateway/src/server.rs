@@ -14,6 +14,7 @@ use std::net::{SocketAddr, TcpListener};
 use axum_server::tls_rustls::RustlsConfig;
 
 use crate::app::{router, AppState};
+use crate::mtls::MtlsAcceptor;
 
 /// Bind a `std::net::TcpListener` to `addr` (use port `0` for an ephemeral port)
 /// and return it with its resolved address.
@@ -68,6 +69,47 @@ where
         handle_for_shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(3)));
     });
     axum_server::from_tcp_rustls(listener, tls)
+        .handle(handle)
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+}
+
+/// Serve the gateway over **mTLS** on an already-bound `TcpListener`, using the
+/// [`MtlsAcceptor`] so each connection's verified client-certificate identity is
+/// injected as an `Option<MtlsPrincipal>` request extension (the auth middleware
+/// prefers it over a bearer). Drives `axum-server` to completion.
+pub async fn serve_mtls(
+    listener: TcpListener,
+    acceptor: MtlsAcceptor,
+    state: AppState,
+) -> std::io::Result<()> {
+    let app = router(state);
+    axum_server::from_tcp(listener)
+        .acceptor(acceptor)
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+}
+
+/// Serve the gateway over mTLS with graceful shutdown (mirrors
+/// [`serve_with_shutdown`] but with the [`MtlsAcceptor`]).
+pub async fn serve_mtls_with_shutdown<F>(
+    listener: TcpListener,
+    acceptor: MtlsAcceptor,
+    state: AppState,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let app = router(state);
+    let handle = axum_server::Handle::new();
+    let handle_for_shutdown = handle.clone();
+    tokio::spawn(async move {
+        shutdown.await;
+        handle_for_shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(3)));
+    });
+    axum_server::from_tcp(listener)
+        .acceptor(acceptor)
         .handle(handle)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await

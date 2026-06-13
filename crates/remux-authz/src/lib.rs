@@ -33,6 +33,7 @@
 
 mod config;
 mod jwt;
+mod mtls;
 mod permission;
 mod policy;
 mod principal;
@@ -40,6 +41,9 @@ mod token_store;
 
 pub use config::{load_auth_config, AuthConfigError, AuthConfigFile, RoleEntry, TokenEntry};
 pub use jwt::{parse_jwks, Jwks, JwtConfig, JwtError, JwtKey, JwtValidator};
+pub use mtls::{
+    load_mtls_identities, IdentityEntry, MtlsIdentities, MtlsIdentityError, MtlsIdentityFile,
+};
 pub use permission::{ParsePermissionError, Permission};
 pub use policy::{builtin_roles, Policy, Role};
 pub use principal::{permits, Authorizer, Principal};

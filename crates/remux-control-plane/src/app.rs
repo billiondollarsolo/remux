@@ -19,6 +19,7 @@ use serde_json::json;
 use tokio::task::JoinSet;
 
 use remux_gateway::dto::{CreateSessionBody, SessionView, SizeBody};
+use remux_gateway::peer_tls::PeerVerification;
 
 use crate::auth::{audit_id_for, bearer_from_header, AuthConfig, Permission, Principal};
 use crate::client::GatewayClient;
@@ -31,8 +32,9 @@ pub struct AppState {
     pub registry: Registry,
     /// Admin + register bearer tokens.
     pub auth: AuthConfig,
-    /// Whether outbound gateway calls accept self-signed certs (v1 default true).
-    pub gateway_tls_insecure: bool,
+    /// How outbound gateway calls verify each gateway's TLS cert (Phase C:
+    /// secure by default — system roots; or CA bundle / SHA-256 pin / dev-insecure).
+    pub gateway_verification: PeerVerification,
     /// Per-gateway request timeout for fan-out / resolve calls.
     pub gateway_timeout: Duration,
 }
@@ -42,14 +44,26 @@ impl AppState {
         Self {
             registry: Registry::new(),
             auth,
-            gateway_tls_insecure: true,
+            // Secure by default: verify gateways against system roots.
+            gateway_verification: PeerVerification::SystemRoots,
             gateway_timeout: crate::client::DEFAULT_GATEWAY_TIMEOUT,
         }
     }
 
-    /// Set the outbound gateway TLS-insecure flag.
+    /// Set the outbound gateway TLS-verification posture.
+    pub fn with_gateway_verification(mut self, verification: PeerVerification) -> Self {
+        self.gateway_verification = verification;
+        self
+    }
+
+    /// Back-compat convenience: set the gateway posture to dev-insecure (`true`)
+    /// or secure system-roots (`false`). Prefer [`Self::with_gateway_verification`].
     pub fn with_gateway_tls_insecure(mut self, insecure: bool) -> Self {
-        self.gateway_tls_insecure = insecure;
+        self.gateway_verification = if insecure {
+            PeerVerification::Insecure
+        } else {
+            PeerVerification::SystemRoots
+        };
         self
     }
 
@@ -65,7 +79,7 @@ impl AppState {
         GatewayClient::new(
             host.gateway_url.clone(),
             host.gateway_token.clone(),
-            self.gateway_tls_insecure,
+            &self.gateway_verification,
             self.gateway_timeout,
         )
     }
@@ -146,16 +160,27 @@ async fn enforce_permission(
     mut request: Request,
     next: Next,
 ) -> Response {
+    // Precedence: a verified client certificate (mTLS) is the authenticated
+    // principal — cert identity WINS over any bearer in the same request.
+    let mtls_principal = request
+        .extensions()
+        .get::<Option<remux_gateway::mtls::MtlsPrincipal>>()
+        .and_then(|o| o.clone());
+
     let presented = extract_token(request.headers());
-    let (principal, method): (Principal, &'static str) = match presented
-        .as_deref()
-        .and_then(|t| state.auth.authenticate(t))
-    {
-        Some((p, m)) => (p, m.as_str()),
-        None => {
-            let body =
-                json!({ "error": "missing or invalid bearer token", "kind": "unauthorized" });
-            return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+    let (principal, method): (Principal, &'static str) = if let Some(mp) = mtls_principal {
+        (mp.0, "mtls")
+    } else {
+        match presented
+            .as_deref()
+            .and_then(|t| state.auth.authenticate(t))
+        {
+            Some((p, m)) => (p, m.as_str()),
+            None => {
+                let body =
+                    json!({ "error": "missing or invalid bearer token", "kind": "unauthorized" });
+                return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+            }
         }
     };
     if !state.auth.permits(&principal, required) {
@@ -168,7 +193,11 @@ async fn enforce_permission(
         });
         return (StatusCode::FORBIDDEN, Json(body)).into_response();
     }
-    let token_id = presented.as_deref().map(audit_id_for).unwrap_or_default();
+    let token_id = if method == "mtls" {
+        format!("cert:{}", principal.subject)
+    } else {
+        presented.as_deref().map(audit_id_for).unwrap_or_default()
+    };
     let ctx = AuthContext {
         subject: principal.subject.clone(),
         roles: principal.roles_display(),

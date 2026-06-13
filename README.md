@@ -390,6 +390,39 @@ The audit line records the auth method (`static` vs `jwt`) alongside the
 principal's subject and roles (never the token). The control plane takes the same
 `--jwt-*` flags (env prefix `REMUX_CP_JWT_*`) for its `/cp/v1` fleet API.
 
+#### mTLS client certificates (Phase C)
+
+A client can authenticate with a **TLS client certificate** instead of (or
+alongside) a bearer. Enable it with `--client-ca <PEM>` — the gateway then requests
+and verifies client certs against that CA. A verified cert's identity becomes the
+authenticated principal, enforcing the **same** per-route permissions as a bearer.
+
+| Flag | Meaning |
+|---|---|
+| `--client-ca <PEM>` | CA bundle to verify client certs against (enables mTLS) |
+| `--mtls-mode require\|optional` | `optional` (default): use a valid cert if presented, else fall back to bearer auth. `require`: a valid cert is mandatory — the TLS handshake refuses connections without one |
+| `--mtls-identities <TOML>` | maps cert identities → roles: `[[identities]] subject="…" roles=[…]` |
+| `--mtls-default-roles <r1,r2>` | roles for a valid-but-unmapped cert (default **none** → it authenticates but is `403` everywhere until mapped) |
+
+The cert **identity** is its subject **CN**, or its first **SAN** when there is no
+CN. **Precedence:** when a valid client cert is presented, the cert identity
+**wins over any bearer** in the same request. The audit line records
+`auth_method = mtls` with the cert subject + roles.
+
+```sh
+# identities.toml:
+#   [[identities]]
+#   subject = "ops-laptop"   # the client cert's CN (or first SAN)
+#   roles   = ["operator"]
+remux-gateway --client-ca client-ca.pem \
+  --mtls-mode optional --mtls-identities identities.toml
+```
+
+The control plane takes the **same** `--client-ca` / `--mtls-mode` /
+`--mtls-identities` / `--mtls-default-roles` flags for its `/cp/v1` fleet API (map
+to fleet roles like `fleet-admin` / `fleet-viewer`). `/health` and
+`/openapi.json` stay public in every mode.
+
 ### Auto-join a control plane (`--register`)
 
 A gateway can **register itself** with a [control plane](#control-plane-fleet-federation)
@@ -419,8 +452,15 @@ remux-gateway --listen 0.0.0.0:8443 --token "$RW_TOKEN" \
   SIGTERM/SIGINT it best-effort `DELETE`s `/cp/v1/hosts/{name}`. Registration
   failures **never crash the gateway** — they're logged and retried with bounded
   backoff while the `/v1` API keeps serving.
-- `--register-tls-insecure` (default **true** for v1) trusts the control plane's
-  self-signed cert; pinning is the deferred follow-up.
+- **Control-plane TLS verification (secure by default).** The register client
+  verifies the control plane's cert against **system roots** by default. To trust a
+  self-signed control plane, pin its leaf with `--register-pin <SHA256>`
+  (repeatable; no CA needed) or trust a CA bundle with `--register-ca <PEM>` (the
+  CP's own self-signed cert works as a CA root). `--register-tls-insecure` now
+  defaults to **`false`** and is an explicit, loudly-logged **dev-only** opt-out.
+  A wrong pin / CA mismatch just fails the registration (logged + retried) — the
+  gateway never crashes. Get the CP's fingerprint from its startup log or
+  `openssl x509 -fingerprint -sha256 -noout -in cp-cert.pem`.
 
 ### REST endpoints
 
@@ -490,9 +530,22 @@ as the gateway (the shared `remux-authz` crate), deny-by-default, constant-time
 token resolution. An unknown/missing token is `401`; a known principal lacking
 the route's permission is `403`. Every request is audit-logged (method, path,
 status, principal subject + roles, hashed token id, peer, latency — never raw
-tokens). v1 **trusts self-signed gateway certs** (`--gateway-tls-insecure`,
-default `true`, logged as a warning); gateway-cert pinning / CA trust is the
-remaining Phase C follow-up.
+tokens).
+
+**Gateway TLS verification (secure by default, Phase C).** Outbound calls to
+gateways verify each gateway's cert against **system roots** by default. To call a
+self-signed gateway, pin its leaf with `--gateway-pin <SHA256>` (repeatable; no CA
+needed) or trust a CA bundle with `--gateway-ca <PEM>` (a gateway's own self-signed
+cert works as a CA root). `--gateway-tls-insecure` now defaults to **`false`** and
+is an explicit, loudly-logged **dev-only** opt-out. A wrong pin / CA mismatch makes
+that gateway's fan-out row `ok:false` with a TLS error — never a panic, and other
+hosts are unaffected.
+
+**mTLS (Phase C).** The control plane also accepts client certificates: the same
+`--client-ca` / `--mtls-mode require|optional` / `--mtls-identities` /
+`--mtls-default-roles` flags as the gateway (map cert identities to fleet roles).
+A verified client cert is the authenticated principal (cert wins over a bearer) and
+enforces the same `/cp/v1` per-route permissions.
 
 **Back-compat token flags.** `--token`/`REMUX_CP_TOKEN` maps to the built-in
 **`fleet-admin`** role (every control-plane permission, a superuser that may also

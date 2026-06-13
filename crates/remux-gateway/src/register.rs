@@ -11,20 +11,25 @@
 //! control plane, and the control plane only ever calls a gateway it was first
 //! told about by that gateway.
 //!
-//! **TLS-trust posture (v1).** The control plane defaults to a self-signed cert,
-//! so `--register-tls-insecure` defaults to `true`: the outbound registration
-//! client accepts self-signed/invalid control-plane certs. This is logged as a
-//! warning at startup — certificate **pinning / CA trust** is the hardening
-//! follow-up.
+//! **TLS-trust posture (Phase C — secure by default).** The registration client
+//! verifies the control plane's certificate against system roots by default. An
+//! operator pins a self-signed control plane with `--register-pin <SHA256>` (no CA
+//! needed) or trusts a CA bundle with `--register-ca <PEM>`. `--register-tls-insecure`
+//! (default **false**) remains an explicit, loudly-logged dev-only opt-out. See
+//! [`crate::peer_tls`].
 //!
 //! Registration failures are **never fatal**: the gateway logs and retries with
-//! bounded backoff and keeps serving its `/v1` API regardless.
+//! bounded backoff and keeps serving its `/v1` API regardless. A wrong pin / CA
+//! mismatch simply surfaces as a TLS error on every attempt (logged) — the
+//! gateway never crashes.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::watch;
+
+use crate::peer_tls::{self, PeerVerification};
 
 /// Everything needed to register this gateway with a control plane.
 #[derive(Debug, Clone)]
@@ -44,8 +49,9 @@ pub struct RegisterConfig {
     pub gateway_token: String,
     /// Registration TTL in seconds; the heartbeat runs every `ttl/2`.
     pub ttl_secs: u64,
-    /// Accept self-signed/invalid control-plane certs (v1 default `true`).
-    pub tls_insecure: bool,
+    /// How to verify the control plane's TLS certificate (secure by default:
+    /// system roots; CA bundle, SHA-256 pin, or dev-only insecure).
+    pub verification: PeerVerification,
 }
 
 /// The bounded backoff schedule for a failed registration attempt (seconds).
@@ -58,12 +64,10 @@ const BACKOFF_SECS: &[u64] = &[1, 2, 5, 10, 15, 30];
 const STARTUP_ATTEMPTS: usize = 6;
 
 /// Build a reqwest client for talking to the control plane, honoring the
-/// self-signed-trust posture and a bounded request timeout.
-fn build_client(tls_insecure: bool) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .danger_accept_invalid_certs(tls_insecure)
-        .timeout(Duration::from_secs(10))
-        .build()
+/// configured TLS-verification posture (system roots / CA bundle / pin / insecure)
+/// and a bounded request timeout.
+fn build_client(verification: &PeerVerification) -> Result<reqwest::Client, String> {
+    peer_tls::build_client(verification, Duration::from_secs(10), "--register-ca")
         .map_err(|e| e.to_string())
 }
 
@@ -155,16 +159,18 @@ pub fn spawn(cfg: RegisterConfig, mut shutdown: watch::Receiver<bool>) {
              the control plane will not be able to call this gateway's /v1 API"
         );
     }
-    if cfg.tls_insecure {
+    if matches!(cfg.verification, PeerVerification::Insecure) {
         tracing::warn!(
             cp_url = %cfg.cp_url,
-            "registering with the control plane while trusting self-signed certs \
-             (--register-tls-insecure, v1 default); cert pinning is a deferred follow-up"
+            "registering with the control plane in INSECURE TLS mode \
+             (--register-tls-insecure): accepting ANY control-plane cert. \
+             Dev only — pin the control plane with --register-pin or trust a CA \
+             with --register-ca for production."
         );
     }
 
     tokio::spawn(async move {
-        let http = match build_client(cfg.tls_insecure) {
+        let http = match build_client(&cfg.verification) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "failed to build control-plane HTTP client; auto-registration disabled");
@@ -266,7 +272,7 @@ mod tests {
             labels,
             gateway_token: "gw-tok".to_string(),
             ttl_secs: 30,
-            tls_insecure: true,
+            verification: PeerVerification::Insecure,
         }
     }
 

@@ -41,6 +41,8 @@ pub mod auth;
 pub mod daemon_conn;
 pub mod error;
 pub mod jwt_service;
+pub mod mtls;
+pub mod peer_tls;
 pub mod register;
 pub mod selector;
 pub mod server;
@@ -56,7 +58,11 @@ pub use auth::AuthConfig;
 pub use daemon_conn::{DaemonConn, WaitOutcome, WaitPredicate};
 pub use error::ApiError;
 pub use jwt_service::{AuthMethod, JwtAuth, JwtSettings, JwtSetupError};
-pub use remux_authz::{Permission, Principal};
+pub use mtls::{MtlsAcceptor, MtlsConfig, MtlsMode, MtlsPrincipal, MtlsSetupError};
+pub use peer_tls::{
+    build_client as build_peer_client, sha256_fingerprint_of_pem, PeerTlsError, PeerVerification,
+};
+pub use remux_authz::{MtlsIdentities, Permission, Principal};
 pub use selector::parse_selector;
-pub use server::{bind_listener, serve};
+pub use server::{bind_listener, serve, serve_mtls};
 pub use tls::TlsMaterial;
