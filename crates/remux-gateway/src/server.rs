@@ -35,7 +35,10 @@ pub async fn serve(
     state: AppState,
 ) -> std::io::Result<()> {
     let app = router(state);
+    // `into_make_service_with_connect_info` makes the peer `SocketAddr` available
+    // to handlers/middleware via `ConnectInfo<SocketAddr>` — used by the audit
+    // middleware to log the client remote address.
     axum_server::from_tcp_rustls(listener, tls)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
 }

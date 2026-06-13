@@ -2,3 +2,4 @@
 
 pub mod convert;
 pub mod dto;
+pub mod openapi;

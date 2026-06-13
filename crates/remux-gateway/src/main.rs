@@ -32,10 +32,17 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:8443")]
     listen: SocketAddr,
 
-    /// Bearer token. If unset, falls back to `REMUX_GATEWAY_TOKEN`; if that is
-    /// also unset, a random token is generated and logged at startup.
+    /// Bearer token granting **read-write** (full) access. If unset, falls back
+    /// to `REMUX_GATEWAY_TOKEN`; if that is also unset, a random token is
+    /// generated and logged at startup.
     #[arg(long, env = "REMUX_GATEWAY_TOKEN")]
     token: Option<String>,
+
+    /// Optional bearer token granting **read-only** access (observe-only
+    /// endpoints + the `/events` WS; rejected with 403 on any write route).
+    /// Falls back to `REMUX_GATEWAY_READ_TOKEN`.
+    #[arg(long, env = "REMUX_GATEWAY_READ_TOKEN")]
+    read_token: Option<String>,
 
     /// TLS certificate (PEM). Must be paired with `--tls-key`. If both are
     /// omitted, a self-signed cert is generated for `127.0.0.1`/`localhost`.
@@ -94,12 +101,16 @@ fn main() {
 async fn run(cli: Cli) -> Result<(), String> {
     let socket_path = resolve_socket_path(cli.socket);
 
-    // Resolve the bearer token (flag/env, else generate + log it jupyter-style).
+    // Resolve the read-write bearer token (flag/env, else generate + log it
+    // jupyter-style).
     let (token, generated) = match cli.token {
         Some(t) if !t.is_empty() => (t, false),
         _ => (generate_token(), true),
     };
-    let auth = AuthConfig::new(token.clone());
+    // Optional read-only token. A value equal to the read-write token is ignored
+    // (the read-write token wins, granting the broader scope).
+    let read_token = cli.read_token.filter(|t| !t.is_empty());
+    let auth = AuthConfig::with_scopes(token.clone(), read_token.clone());
 
     // Resolve TLS material (operator PEM or self-signed for loopback).
     let tls = TlsMaterial::resolve(cli.tls_cert, cli.tls_key)?;
@@ -137,7 +148,14 @@ async fn run(cli: Cli) -> Result<(), String> {
     } else {
         tracing::info!("using bearer token from --token/REMUX_GATEWAY_TOKEN");
     }
-    tracing::info!(token_id = %auth.token_audit_id(), "bearer auth active (deny-by-default)");
+    tracing::info!(
+        token_id = %auth.token_audit_id(),
+        read_only_token = auth.has_read_only(),
+        "bearer auth active (deny-by-default; read-write + optional read-only scopes)"
+    );
+    if read_token.is_some() {
+        tracing::info!("read-only token configured (observe-only scope)");
+    }
 
     let state = AppState::new(socket_path, auth);
 

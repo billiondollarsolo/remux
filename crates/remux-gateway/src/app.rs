@@ -2,13 +2,14 @@
 //! [`ApiError`] to a JSON HTTP response, the bearer-auth middleware, and the
 //! REST handlers (AW2). WebSocket handlers (AW3) live in [`crate::ws`].
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, Request, State},
+    extract::{ConnectInfo, Path, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
@@ -20,11 +21,12 @@ use serde_json::json;
 
 use remux_core::TermSize;
 
-use crate::auth::{bearer_from_header, AuthConfig};
+use crate::auth::{audit_id_for, bearer_from_header, AuthConfig, Scope};
 use crate::convert::wait_result;
 use crate::daemon_conn::WaitPredicate;
 use crate::dto::{
-    CreateSessionBody, ResizeBody, ScreenView, ScrollbackView, SessionView, WaitBody,
+    ApiErrorBody, CreateSessionBody, InputBody, RenameBody, ResizeBody, ScreenView, ScrollbackView,
+    SessionView, WaitBody, WaitResult,
 };
 use crate::error::ApiError;
 use crate::selector::parse_selector;
@@ -90,47 +92,184 @@ fn err_kind(err: &ApiError) -> &'static str {
     }
 }
 
+/// Identity resolved by the auth middleware and stashed in request extensions so
+/// the audit middleware can log it without re-resolving the token.
+#[derive(Clone)]
+struct AuthContext {
+    scope: Scope,
+    token_id: String,
+}
+
 /// Build the full router with auth + the `/v1` surface.
+///
+/// The authed surface is split by **required scope** (plan §6.2):
+/// - read routes (list/inspect/screen/scrollback/wait, `/events` WS) require
+///   `Scope::ReadOnly` — a read-write token satisfies them too.
+/// - write routes (create/delete/rename/input/resize, `/stream` WS) require
+///   `Scope::ReadWrite`.
+///
+/// Each group runs a scope-enforcing middleware that resolves the bearer to a
+/// scope (else `401`) and rejects an under-scoped token with `403`. A per-request
+/// audit middleware wraps the whole `/v1` surface.
 pub fn router(state: AppState) -> Router {
-    // The `/v1` surface that REQUIRES auth (everything except health).
-    let authed = Router::new()
-        .route("/sessions", get(list_sessions).post(create_session))
-        .route(
-            "/sessions/:id",
-            get(get_session).delete(delete_session).patch(patch_session),
-        )
-        .route("/sessions/:id/input", post(send_input))
+    // Read-scope routes: safe/observe-only.
+    let read_routes = Router::new()
+        .route("/sessions", get(list_sessions))
+        .route("/sessions/:id", get(get_session))
         .route("/sessions/:id/screen", get(get_screen))
         .route("/sessions/:id/scrollback", get(get_scrollback))
-        .route("/sessions/:id/resize", post(resize_session))
         .route("/sessions/:id/wait", post(wait_session))
-        .route("/sessions/:id/stream", get(crate::ws::stream_ws))
         .route("/sessions/:id/events", get(crate::ws::events_ws))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_layer));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_read_scope,
+        ));
 
-    // Health is public (no auth).
-    let public = Router::new().route("/health", get(health));
+    // Write-scope routes: mutate or inject.
+    let write_routes = Router::new()
+        .route("/sessions", post(create_session))
+        .route(
+            "/sessions/:id",
+            axum::routing::delete(delete_session).patch(patch_session),
+        )
+        .route("/sessions/:id/input", post(send_input))
+        .route("/sessions/:id/resize", post(resize_session))
+        .route("/sessions/:id/stream", get(crate::ws::stream_ws))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_write_scope,
+        ));
+
+    // Public (no auth): health + the OpenAPI document (discoverability).
+    let public = Router::new()
+        .route("/health", get(health))
+        .route("/openapi.json", get(openapi_json));
 
     Router::new()
-        .nest("/v1", public.merge(authed))
+        .nest("/v1", public.merge(read_routes).merge(write_routes))
+        // Audit every /v1 request (after routing, so the matched path is known).
+        .layer(middleware::from_fn(audit_layer))
         .with_state(state)
 }
 
-/// Bearer-auth middleware. Deny-by-default: rejects with `401` + a small JSON
-/// body unless a valid token is presented.
+/// Scope-enforcing middleware for the **read** routes.
+async fn require_read_scope(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    enforce_scope(state, Scope::ReadOnly, request, next).await
+}
+
+/// Scope-enforcing middleware for the **write** routes.
+async fn require_write_scope(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    enforce_scope(state, Scope::ReadWrite, request, next).await
+}
+
+/// Resolve the presented bearer to a scope and enforce `required`.
 ///
-/// Accepts the token via the `Authorization: Bearer <token>` header (REST + WS)
-/// and, for WebSocket upgrade routes, additionally via `?token=<token>` (browsers
-/// cannot set `Authorization` on a WS handshake). The query fallback is accepted
-/// on every authed route for simplicity; it is only meaningful for WS.
-async fn auth_layer(State(state): State<AppState>, request: Request, next: Next) -> Response {
+/// Deny-by-default:
+/// - no/unknown token → `401` (`unauthorized`).
+/// - a recognized token whose scope does not satisfy `required` → `403`
+///   (`forbidden`), a distinct outcome from the `401`.
+///
+/// On success the resolved [`AuthContext`] is inserted into request extensions
+/// so the audit layer can log the scope + token id.
+async fn enforce_scope(
+    state: AppState,
+    required: Scope,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let presented = extract_token(request.headers(), request.uri().query());
-    let ok = presented.map(|t| state.auth.verify(&t)).unwrap_or(false);
-    if !ok {
-        let body = json!({ "error": "missing or invalid bearer token", "kind": "unauthorized" });
-        return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+    let scope = presented
+        .as_deref()
+        .and_then(|t| state.auth.resolve_scope(t));
+    let scope = match scope {
+        Some(s) => s,
+        None => {
+            let body =
+                json!({ "error": "missing or invalid bearer token", "kind": "unauthorized" });
+            return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+        }
+    };
+    if !scope.satisfies(required) {
+        let body = json!({
+            "error": "this token is read-only; a read-write token is required for this endpoint",
+            "kind": "forbidden",
+        });
+        return (StatusCode::FORBIDDEN, Json(body)).into_response();
     }
-    next.run(request).await
+    // Stash identity for the audit layer (token never logged in the clear).
+    let token_id = presented.as_deref().map(audit_id_for).unwrap_or_default();
+    let ctx = AuthContext { scope, token_id };
+    request.extensions_mut().insert(ctx.clone());
+    let mut response = next.run(request).await;
+    // Propagate the identity onto the response so the (outer) audit layer can
+    // log it — request-extension mutations made here are not visible to the
+    // outer layer, but response extensions are.
+    response.extensions_mut().insert(ctx);
+    response
+}
+
+/// Per-request audit middleware (plan §6.2 "Audit log").
+///
+/// Emits one structured `tracing` line per `/v1` request with: method, the
+/// matched route path (with `{id}` placeholders, not the concrete id), HTTP
+/// status, the resolved scope + non-reversible `token_id` (or `anonymous` for
+/// the public routes / rejected requests), the client remote address, and the
+/// latency in ms. **No secret material is logged** — only the hashed token id.
+async fn audit_layer(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    // Prefer the matched route template (`/v1/sessions/:id`) over the concrete
+    // URI so ids are not spread across cardinality-exploding log lines.
+    let path = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    let remote = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let start = Instant::now();
+    let response = next.run(request).await;
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    // The auth context (if any) was inserted by the scope middleware; for public
+    // or rejected requests it is absent → anonymous.
+    let (scope, token_id) = match response.extensions().get::<AuthContext>() {
+        Some(ctx) => (scope_str(ctx.scope), ctx.token_id.clone()),
+        None => ("anonymous", "anonymous".to_string()),
+    };
+
+    tracing::info!(
+        target: "remux_gateway::audit",
+        method = %method,
+        path = %path,
+        status = response.status().as_u16(),
+        scope = scope,
+        token_id = %token_id,
+        remote = %remote,
+        latency_ms = format!("{latency_ms:.2}"),
+        "request"
+    );
+
+    response
+}
+
+/// The public string form of a scope for audit lines.
+fn scope_str(scope: Scope) -> &'static str {
+    match scope {
+        Scope::ReadOnly => "read",
+        Scope::ReadWrite => "read_write",
+    }
 }
 
 /// Pull a bearer token from the `Authorization` header or the `token` query param.
@@ -190,12 +329,42 @@ fn urldecode(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// `GET /v1/health` — liveness, no auth.
-async fn health() -> impl IntoResponse {
+#[utoipa::path(
+    get,
+    path = "/v1/health",
+    tag = "health",
+    responses((status = 200, description = "Gateway is live")),
+)]
+pub(crate) async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
+/// `GET /v1/openapi.json` — the generated OpenAPI 3.1 document (no auth, for
+/// discoverability).
+#[utoipa::path(
+    get,
+    path = "/v1/openapi.json",
+    tag = "meta",
+    responses((status = 200, description = "OpenAPI 3.1 document for the /v1 surface")),
+)]
+pub(crate) async fn openapi_json() -> impl IntoResponse {
+    Json(crate::api::v1::openapi::api_doc())
+}
+
 /// `GET /v1/sessions` — list sessions.
-async fn list_sessions(State(state): State<AppState>) -> Result<Response, ApiErrorResponse> {
+#[utoipa::path(
+    get,
+    path = "/v1/sessions",
+    tag = "sessions",
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "All sessions", body = [SessionView]),
+        (status = 401, description = "Missing or invalid token", body = ApiErrorBody),
+    ),
+)]
+pub(crate) async fn list_sessions(
+    State(state): State<AppState>,
+) -> Result<Response, ApiErrorResponse> {
     let mut conn = state.connect().await?;
     let summaries = conn.list_sessions().await?;
     let views: Vec<SessionView> = summaries.into_iter().map(SessionView::from).collect();
@@ -203,7 +372,20 @@ async fn list_sessions(State(state): State<AppState>) -> Result<Response, ApiErr
 }
 
 /// `POST /v1/sessions` — create a session.
-async fn create_session(
+#[utoipa::path(
+    post,
+    path = "/v1/sessions",
+    tag = "sessions",
+    security(("bearer" = [])),
+    request_body = CreateSessionBody,
+    responses(
+        (status = 201, description = "Session created", body = SessionView),
+        (status = 400, description = "Invalid request", body = ApiErrorBody),
+        (status = 401, description = "Missing or invalid token", body = ApiErrorBody),
+        (status = 403, description = "Read-only token", body = ApiErrorBody),
+    ),
+)]
+pub(crate) async fn create_session(
     State(state): State<AppState>,
     Json(body): Json<CreateSessionBody>,
 ) -> Result<Response, ApiErrorResponse> {
@@ -223,7 +405,19 @@ async fn create_session(
 }
 
 /// `GET /v1/sessions/{id}` — inspect a session.
-async fn get_session(
+#[utoipa::path(
+    get,
+    path = "/v1/sessions/{id}",
+    tag = "sessions",
+    security(("bearer" = [])),
+    params(("id" = String, Path, description = "Session uuid or name")),
+    responses(
+        (status = 200, description = "Session details", body = SessionView),
+        (status = 401, description = "Missing or invalid token", body = ApiErrorBody),
+        (status = 404, description = "No such session", body = ApiErrorBody),
+    ),
+)]
+pub(crate) async fn get_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiErrorResponse> {
@@ -234,12 +428,28 @@ async fn get_session(
 }
 
 #[derive(Debug, Deserialize)]
-struct DeleteQuery {
+pub(crate) struct DeleteQuery {
     signal: Option<i32>,
 }
 
 /// `DELETE /v1/sessions/{id}` — kill a session.
-async fn delete_session(
+#[utoipa::path(
+    delete,
+    path = "/v1/sessions/{id}",
+    tag = "sessions",
+    security(("bearer" = [])),
+    params(
+        ("id" = String, Path, description = "Session uuid or name"),
+        ("signal" = Option<i32>, Query, description = "Signal to send (default SIGTERM)"),
+    ),
+    responses(
+        (status = 204, description = "Session killed"),
+        (status = 401, description = "Missing or invalid token", body = ApiErrorBody),
+        (status = 403, description = "Read-only token", body = ApiErrorBody),
+        (status = 404, description = "No such session", body = ApiErrorBody),
+    ),
+)]
+pub(crate) async fn delete_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<DeleteQuery>,
@@ -249,13 +459,22 @@ async fn delete_session(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-#[derive(Debug, Deserialize)]
-struct RenameBody {
-    name: String,
-}
-
 /// `PATCH /v1/sessions/{id}` — rename a session.
-async fn patch_session(
+#[utoipa::path(
+    patch,
+    path = "/v1/sessions/{id}",
+    tag = "sessions",
+    security(("bearer" = [])),
+    params(("id" = String, Path, description = "Session uuid or name")),
+    request_body = RenameBody,
+    responses(
+        (status = 200, description = "Updated session", body = SessionView),
+        (status = 401, description = "Missing or invalid token", body = ApiErrorBody),
+        (status = 403, description = "Read-only token", body = ApiErrorBody),
+        (status = 404, description = "No such session", body = ApiErrorBody),
+    ),
+)]
+pub(crate) async fn patch_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<RenameBody>,
@@ -276,7 +495,21 @@ async fn patch_session(
 ///   or `{ "bytes_hex": "1b5b41" }`.
 /// - any other content type (e.g. `application/octet-stream`) → the raw body
 ///   bytes are sent verbatim.
-async fn send_input(
+#[utoipa::path(
+    post,
+    path = "/v1/sessions/{id}/input",
+    tag = "sessions",
+    security(("bearer" = [])),
+    params(("id" = String, Path, description = "Session uuid or name")),
+    request_body = InputBody,
+    responses(
+        (status = 202, description = "Input accepted (fire-and-forget)"),
+        (status = 400, description = "Invalid input body", body = ApiErrorBody),
+        (status = 401, description = "Missing or invalid token", body = ApiErrorBody),
+        (status = 403, description = "Read-only token", body = ApiErrorBody),
+    ),
+)]
+pub(crate) async fn send_input(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
@@ -291,7 +524,7 @@ async fn send_input(
     let data: Vec<u8> = if is_json {
         let parsed: InputBody = serde_json::from_slice(&body)
             .map_err(|e| ApiError::BadRequest(format!("invalid input body: {e}")))?;
-        parsed.into_bytes()?
+        input_body_to_bytes(parsed)?
     } else {
         body.to_vec()
     };
@@ -301,25 +534,18 @@ async fn send_input(
     Ok(StatusCode::ACCEPTED.into_response())
 }
 
-/// JSON body for `POST .../input`: exactly one of `text` / `bytes_hex`.
-#[derive(Debug, Deserialize)]
-struct InputBody {
-    text: Option<String>,
-    bytes_hex: Option<String>,
-}
-
-impl InputBody {
-    fn into_bytes(self) -> Result<Vec<u8>, ApiError> {
-        match (self.text, self.bytes_hex) {
-            (Some(t), None) => Ok(interpret_text_escapes(&t)),
-            (None, Some(h)) => decode_hex(&h),
-            (Some(_), Some(_)) => Err(ApiError::BadRequest(
-                "provide exactly one of `text` or `bytes_hex`".to_string(),
-            )),
-            (None, None) => Err(ApiError::BadRequest(
-                "input body must contain `text` or `bytes_hex`".to_string(),
-            )),
-        }
+/// Convert an [`InputBody`] (the JSON form) into the raw bytes to send: exactly
+/// one of `text` / `bytes_hex`.
+fn input_body_to_bytes(body: InputBody) -> Result<Vec<u8>, ApiError> {
+    match (body.text, body.bytes_hex) {
+        (Some(t), None) => Ok(interpret_text_escapes(&t)),
+        (None, Some(h)) => decode_hex(&h),
+        (Some(_), Some(_)) => Err(ApiError::BadRequest(
+            "provide exactly one of `text` or `bytes_hex`".to_string(),
+        )),
+        (None, None) => Err(ApiError::BadRequest(
+            "input body must contain `text` or `bytes_hex`".to_string(),
+        )),
     }
 }
 
@@ -385,7 +611,19 @@ fn decode_hex(h: &str) -> Result<Vec<u8>, ApiError> {
 }
 
 /// `GET /v1/sessions/{id}/screen` — capture the screen as structured JSON cells.
-async fn get_screen(
+#[utoipa::path(
+    get,
+    path = "/v1/sessions/{id}/screen",
+    tag = "sessions",
+    security(("bearer" = [])),
+    params(("id" = String, Path, description = "Session uuid or name")),
+    responses(
+        (status = 200, description = "Structured screen snapshot", body = ScreenView),
+        (status = 401, description = "Missing or invalid token", body = ApiErrorBody),
+        (status = 404, description = "No such session", body = ApiErrorBody),
+    ),
+)]
+pub(crate) async fn get_screen(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiErrorResponse> {
@@ -396,12 +634,27 @@ async fn get_screen(
 }
 
 #[derive(Debug, Deserialize)]
-struct ScrollbackQuery {
+pub(crate) struct ScrollbackQuery {
     lines: Option<usize>,
 }
 
 /// `GET /v1/sessions/{id}/scrollback?lines=N` — read scrollback as decoded text.
-async fn get_scrollback(
+#[utoipa::path(
+    get,
+    path = "/v1/sessions/{id}/scrollback",
+    tag = "sessions",
+    security(("bearer" = [])),
+    params(
+        ("id" = String, Path, description = "Session uuid or name"),
+        ("lines" = Option<usize>, Query, description = "Max lines (default 1000)"),
+    ),
+    responses(
+        (status = 200, description = "Scrollback chunk", body = ScrollbackView),
+        (status = 401, description = "Missing or invalid token", body = ApiErrorBody),
+        (status = 404, description = "No such session", body = ApiErrorBody),
+    ),
+)]
+pub(crate) async fn get_scrollback(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<ScrollbackQuery>,
@@ -420,7 +673,21 @@ async fn get_scrollback(
 /// resize, and detaches. This may transiently steal control from a live
 /// `/stream` attachment (the daemon emits `ControlLost`), which is the intended
 /// semantics of an explicit resize request.
-async fn resize_session(
+#[utoipa::path(
+    post,
+    path = "/v1/sessions/{id}/resize",
+    tag = "sessions",
+    security(("bearer" = [])),
+    params(("id" = String, Path, description = "Session uuid or name")),
+    request_body = ResizeBody,
+    responses(
+        (status = 200, description = "Resized"),
+        (status = 401, description = "Missing or invalid token", body = ApiErrorBody),
+        (status = 403, description = "Read-only token", body = ApiErrorBody),
+        (status = 404, description = "No such session", body = ApiErrorBody),
+    ),
+)]
+pub(crate) async fn resize_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<ResizeBody>,
@@ -440,12 +707,29 @@ async fn resize_session(
 }
 
 #[derive(Debug, Deserialize)]
-struct WaitQuery {
+pub(crate) struct WaitQuery {
     timeout_ms: Option<u64>,
 }
 
 /// `POST /v1/sessions/{id}/wait` — wait on semantic state.
-async fn wait_session(
+#[utoipa::path(
+    post,
+    path = "/v1/sessions/{id}/wait",
+    tag = "sessions",
+    security(("bearer" = [])),
+    params(
+        ("id" = String, Path, description = "Session uuid or name"),
+        ("timeout_ms" = Option<u64>, Query, description = "Overall wait timeout in ms"),
+    ),
+    request_body = WaitBody,
+    responses(
+        (status = 200, description = "Wait outcome", body = WaitResult),
+        (status = 400, description = "Invalid predicate (e.g. bad regex)", body = ApiErrorBody),
+        (status = 401, description = "Missing or invalid token", body = ApiErrorBody),
+        (status = 404, description = "No such session", body = ApiErrorBody),
+    ),
+)]
+pub(crate) async fn wait_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<WaitQuery>,
@@ -538,17 +822,17 @@ mod tests {
             text: None,
             bytes_hex: None,
         };
-        assert!(none.into_bytes().is_err());
+        assert!(input_body_to_bytes(none).is_err());
         let both = InputBody {
             text: Some("a".into()),
             bytes_hex: Some("61".into()),
         };
-        assert!(both.into_bytes().is_err());
+        assert!(input_body_to_bytes(both).is_err());
         let text = InputBody {
             text: Some("hi\\n".into()),
             bytes_hex: None,
         };
-        assert_eq!(text.into_bytes().unwrap(), b"hi\n");
+        assert_eq!(input_body_to_bytes(text).unwrap(), b"hi\n");
     }
 
     #[test]

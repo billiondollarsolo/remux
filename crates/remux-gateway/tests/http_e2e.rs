@@ -163,6 +163,28 @@ async fn rest_full_lifecycle_over_tls() {
 }
 
 #[tokio::test]
+async fn openapi_json_served_unauthenticated() {
+    let harness = start_harness().await;
+    let gw = start_gateway(harness.socket_path().to_path_buf()).await;
+    let http = client();
+
+    // No bearer token: the OpenAPI document is public for discoverability.
+    let resp = http
+        .get(format!("{}/v1/openapi.json", gw.base_url))
+        .send()
+        .await
+        .expect("openapi request");
+    assert_eq!(resp.status(), 200, "openapi.json should be public 200");
+    let doc: serde_json::Value = resp.json().await.expect("openapi json");
+    let version = doc["openapi"].as_str().expect("openapi version");
+    assert!(version.starts_with("3.1"), "expected 3.1.x, got {version}");
+    assert!(
+        doc["paths"]["/v1/sessions"].is_object(),
+        "/v1/sessions path missing from served spec"
+    );
+}
+
+#[tokio::test]
 async fn rest_wait_endpoint_over_tls() {
     let harness = start_harness().await;
     let gw = start_gateway(harness.socket_path().to_path_buf()).await;

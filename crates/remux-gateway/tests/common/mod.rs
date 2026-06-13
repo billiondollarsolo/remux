@@ -12,8 +12,11 @@ use remux_gateway::auth::AuthConfig;
 use remux_gateway::tls::TlsMaterial;
 use remux_testkit::DaemonHarness;
 
-/// The fixed bearer token the e2e tests authenticate with.
+/// The fixed read-write bearer token the e2e tests authenticate with.
 pub const TEST_TOKEN: &str = "test-gateway-token-abc123";
+
+/// The fixed read-only bearer token used by the scope-enforcement tests.
+pub const TEST_READ_TOKEN: &str = "test-gateway-read-token-xyz789";
 
 /// Locate the freshly built `remuxd` binary (mirrors `daemon_conn_e2e.rs`).
 pub fn locate_remuxd() -> PathBuf {
@@ -72,8 +75,21 @@ pub fn ensure_crypto_provider() {
 }
 
 /// Start the gateway in-process, bound to `127.0.0.1:0`, with a generated
-/// self-signed cert and the fixed [`TEST_TOKEN`], pointed at `socket_path`.
+/// self-signed cert and the fixed read-write [`TEST_TOKEN`] (no read-only token),
+/// pointed at `socket_path`.
 pub async fn start_gateway(socket_path: PathBuf) -> GatewayHandle {
+    start_gateway_with_auth(socket_path, AuthConfig::new(TEST_TOKEN.to_string())).await
+}
+
+/// Start the gateway with both the read-write [`TEST_TOKEN`] and the read-only
+/// [`TEST_READ_TOKEN`] configured (for scope-enforcement tests).
+pub async fn start_gateway_with_scopes(socket_path: PathBuf) -> GatewayHandle {
+    let auth = AuthConfig::with_scopes(TEST_TOKEN.to_string(), Some(TEST_READ_TOKEN.to_string()));
+    start_gateway_with_auth(socket_path, auth).await
+}
+
+/// Start the gateway with an explicit [`AuthConfig`].
+pub async fn start_gateway_with_auth(socket_path: PathBuf, auth: AuthConfig) -> GatewayHandle {
     ensure_crypto_provider();
 
     let tls = TlsMaterial::generate_self_signed().expect("generate self-signed cert");
@@ -83,7 +99,6 @@ pub async fn start_gateway(socket_path: PathBuf) -> GatewayHandle {
     let (listener, addr) = remux_gateway::server::bind_listener("127.0.0.1:0".parse().unwrap())
         .expect("bind ephemeral loopback port");
 
-    let auth = AuthConfig::new(TEST_TOKEN.to_string());
     let state = AppState::new(socket_path, auth);
 
     tokio::spawn(async move {

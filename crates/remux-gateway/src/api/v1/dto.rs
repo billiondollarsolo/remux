@@ -14,6 +14,7 @@
 
 use remux_core::TerminalSnapshot;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// Default terminal size used when a `CreateSessionBody` omits `size`.
 pub fn default_size() -> SizeBody {
@@ -24,16 +25,20 @@ pub fn default_size() -> SizeBody {
 ///
 /// Independent of `protocol::SessionSummary`/`SessionDetails`: uuid and
 /// timestamp are strings, and `status` is a lowercase token.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SessionView {
     /// uuid as string (stable JSON).
+    #[schema(example = "5f3c0000-0000-0000-0000-000000000000")]
     pub id: String,
+    #[schema(example = "build")]
     pub name: String,
     /// `"running" | "exited" | "starting" | "failed"`.
+    #[schema(example = "running")]
     pub status: String,
     pub command: Vec<String>,
     pub cwd: String,
     /// RFC3339 timestamp.
+    #[schema(example = "2026-06-13T18:02:11+00:00")]
     pub created_at: String,
     pub pid: Option<u32>,
     pub attached_clients: usize,
@@ -41,9 +46,11 @@ pub struct SessionView {
 }
 
 /// Terminal dimensions in the public contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SizeBody {
+    #[schema(example = 80)]
     pub cols: u16,
+    #[schema(example = 24)]
     pub rows: u16,
 }
 
@@ -54,7 +61,7 @@ impl Default for SizeBody {
 }
 
 /// Request body for `POST /v1/sessions`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct CreateSessionBody {
     #[serde(default)]
     pub name: Option<String>,
@@ -70,7 +77,7 @@ pub struct CreateSessionBody {
 }
 
 /// Request body for `POST /v1/sessions/{id}/resize`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ResizeBody {
     pub cols: u16,
     pub rows: u16,
@@ -80,7 +87,7 @@ pub struct ResizeBody {
 ///
 /// Tagged on `kind` with `snake_case` variant names, mirroring the CLI's
 /// `--idle` / `--for-regex` / `--exit` modes (`cmd/wait.rs`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WaitBody {
     /// Succeed when no output arrives for `ms` milliseconds.
@@ -92,10 +99,11 @@ pub enum WaitBody {
 }
 
 /// Result of a wait.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct WaitResult {
     /// `"matched" | "idle" | "exited" | "timeout"`.
+    #[schema(example = "matched")]
     pub result: String,
     pub exit_code: Option<i32>,
 }
@@ -112,13 +120,109 @@ pub struct WaitResult {
 #[serde(transparent)]
 pub struct ScreenView(pub TerminalSnapshot);
 
+/// Manual schema for [`ScreenView`]: the inner `TerminalSnapshot` lives in
+/// `remux-core` (which has no `utoipa` dependency), so we describe the public
+/// structured-screen contract here by hand. It documents the grid metadata and
+/// the per-cell shape (the differentiator's payload) without coupling
+/// `remux-core` to `utoipa`.
+impl utoipa::ToSchema for ScreenView {}
+
+impl utoipa::PartialSchema for ScreenView {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{ObjectBuilder, Schema, Type};
+        use utoipa::openapi::{KnownFormat, SchemaFormat};
+
+        let u16_prop = || {
+            ObjectBuilder::new()
+                .schema_type(Type::Integer)
+                .format(Some(SchemaFormat::KnownFormat(KnownFormat::Int32)))
+                .build()
+        };
+        let cell = ObjectBuilder::new()
+            .schema_type(Type::Object)
+            .description(Some(
+                "A single rendered cell: its character plus fg/bg color and SGR \
+                 attributes (the structured per-cell payload).",
+            ))
+            .property("ch", ObjectBuilder::new().schema_type(Type::String).build())
+            .property("fg", ObjectBuilder::new().build())
+            .property("bg", ObjectBuilder::new().build())
+            .property(
+                "bold",
+                ObjectBuilder::new().schema_type(Type::Boolean).build(),
+            )
+            .build();
+
+        let obj = ObjectBuilder::new()
+            .schema_type(Type::Object)
+            .description(Some(
+                "The structured screen snapshot: grid dimensions, cursor \
+                 position, alt-screen flag, and the flat per-cell grid. Pinned \
+                 under /v1 (mirrors remux-core's TerminalSnapshot).",
+            ))
+            .property("cols", u16_prop())
+            .property("rows", u16_prop())
+            .property("cursor_row", u16_prop())
+            .property("cursor_col", u16_prop())
+            .property(
+                "alternate_screen",
+                ObjectBuilder::new().schema_type(Type::Boolean).build(),
+            )
+            .property(
+                "cells",
+                utoipa::openapi::schema::ArrayBuilder::new()
+                    .items(cell)
+                    .build(),
+            )
+            .build();
+        utoipa::openapi::RefOr::T(Schema::Object(obj))
+    }
+}
+
 /// A chunk of scrollback, as the public contract exposes it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ScrollbackView {
     /// Decoded text (lossy UTF-8). Raw-byte access is an AW2 content-type
     /// concern; the DTO carries decoded text for the JSON path.
     pub text: String,
     pub lines: usize,
+}
+
+/// JSON body for `POST /v1/sessions/{id}/input` (the `application/json` form).
+///
+/// Exactly one of `text` (with `\n \t \r \\` interpreted) or `bytes_hex`
+/// (e.g. `"1b5b41"`). Raw binary may also be POSTed with a non-JSON content type
+/// and a raw body. This DTO exists so the input contract is part of the OpenAPI
+/// spec; the handler parses the same shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct InputBody {
+    /// Text input; only `\n \t \r \\` escapes are interpreted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "echo hello\\n")]
+    pub text: Option<String>,
+    /// Hex-encoded raw bytes (e.g. `"1b5b41"` for an up-arrow).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_hex: Option<String>,
+}
+
+/// Request body for `PATCH /v1/sessions/{id}` (rename).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RenameBody {
+    #[schema(example = "new-name")]
+    pub name: String,
+}
+
+/// The consistent JSON error body the gateway returns on any error
+/// (`{ "error": "...", "kind": "..." }`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ApiErrorBody {
+    /// Human-readable message.
+    #[schema(example = "not found: no such session")]
+    pub error: String,
+    /// Stable machine-readable category (e.g. `not_found`, `forbidden`,
+    /// `bad_request`, `unauthorized`, `daemon_unavailable`).
+    #[schema(example = "not_found")]
+    pub kind: String,
 }
 
 #[cfg(test)]

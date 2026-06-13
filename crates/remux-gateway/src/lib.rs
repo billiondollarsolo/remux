@@ -19,13 +19,16 @@
 //!   pre-defining the taxonomy AW2's axum server will reuse.
 //!
 //! AW2/AW3/AW4 build on this foundation, all in this crate:
-//! - [`app`] — the axum router, REST `/v1` handlers, the JSON error wrapper, and
-//!   the bearer-auth middleware.
+//! - [`app`] — the axum router, REST `/v1` handlers, the JSON error wrapper, the
+//!   scope-enforcing bearer-auth middleware, and the per-request audit middleware.
 //! - [`ws`] — the WebSocket `/stream` (binary, attachable) and `/events`
 //!   (structured JSON) endpoints.
-//! - [`auth`] — static bearer-token auth with a constant-time compare.
+//! - [`auth`] — static bearer-token auth with a constant-time compare and a
+//!   coarse read/read-write [`Scope`] split (plan §6.2).
 //! - [`tls`] — rustls material (operator PEM or self-signed for loopback).
 //! - [`server`] — serving over TLS via `axum-server`.
+//! - [`api::v1::openapi`] — the generated OpenAPI 3.1 document (T0.5), served at
+//!   `GET /v1/openapi.json` and committed to `docs/openapi.yaml`.
 //!
 //! The `remux-gateway` binary (`src/main.rs`) ties these together: a
 //! TLS-terminating, bearer-authed HTTPS/WSS server bound to `127.0.0.1` by
@@ -43,8 +46,9 @@ pub mod ws;
 
 pub use api::v1::convert;
 pub use api::v1::dto;
+pub use api::v1::openapi;
 pub use app::{router, AppState};
-pub use auth::AuthConfig;
+pub use auth::{AuthConfig, Scope};
 pub use daemon_conn::{DaemonConn, WaitOutcome, WaitPredicate};
 pub use error::ApiError;
 pub use selector::parse_selector;

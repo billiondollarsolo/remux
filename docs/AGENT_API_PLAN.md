@@ -237,10 +237,15 @@ structured-cells contract is shared but still gateway-owned.
 - **T0.4** ✅ **Done.** Public `ApiError` (`src/error.rs`) derived from
   `RemuxError` + the exit-code taxonomy, with `fn http_status(&self) -> u16`
   (404/403/504/503/400/502/500). Returns a bare `u16` — no `http`/axum dependency.
-- **T0.5** ⏸️ **Deferred to AW2.** OpenAPI generation (`utoipa` → `docs/openapi.yaml`)
-  pulls significant weight and is best generated *from the axum handlers*, so it
-  is deferred to AW2 where the HTTP surface is actually implemented. The DTOs here
-  are the source of truth the AW2 spec will be generated from.
+- **T0.5** ✅ **Done.** OpenAPI 3.1 generation (`utoipa`) lands with the axum
+  handlers: the DTOs derive `ToSchema` (`src/api/v1/dto.rs`) and the handlers carry
+  `#[utoipa::path(...)]` (`src/app.rs`), assembled into an `OpenApi` doc in
+  `src/api/v1/openapi.rs` (with the `bearer` security scheme + the `ApiErrorBody`
+  shape). Served at `GET /v1/openapi.json` (unauth, for discoverability) and
+  committed serialized-to-YAML at `docs/openapi.yaml`. A drift test
+  (`tests/openapi.rs`) regenerates the spec in-memory and asserts it equals the
+  committed file; regenerate with `UPDATE_OPENAPI=1 cargo test -p remux-gateway
+  --test openapi`.
 
 ### 2.5 Tests
 
@@ -259,8 +264,11 @@ structured-cells contract is shared but still gateway-owned.
 - [x] `DaemonConn` connects over the **Unix socket only** and handshakes; an
       integration test drives create → list → capture-screen → kill through the
       `/v1` DTO layer against a real daemon (`tests/daemon_conn_e2e.rs`).
-- [ ] OpenAPI `/v1` document generated and CI-validated. — **Deferred to AW2**
-      (see T0.5): generated from the axum handlers once they exist.
+- [x] OpenAPI `/v1` document generated and CI-validated. **Done** (see T0.5):
+      generated from the axum handlers via `utoipa`, served at
+      `GET /v1/openapi.json`, committed to `docs/openapi.yaml`, and a drift test
+      (`tests/openapi.rs`) keeps the committed file in sync (asserts OpenAPI 3.1 +
+      the presence of known paths).
 - [x] A daemon `PROTOCOL_VERSION` mismatch is refused, not silently proxied
       (`check_protocol_version` is unit-tested directly with `PROTOCOL_VERSION + 1`).
       The public `/v1` DTOs are decoupled from `protocol.rs` so an internal wire
@@ -524,8 +532,11 @@ Returns the scrollback chunk; `Accept: application/octet-stream` for raw bytes,
       **Done** — `GET /v1/sessions/{id}/screen` returns the `ScreenView`
       (transparent over `TerminalSnapshot`); the `http_e2e` test reconstructs
       rows from the JSON cell grid.
-- [ ] OpenAPI doc matches the implemented surface; CI checks drift. — **Still
-      deferred** (no `utoipa` yet); the DTOs remain the source of truth.
+- [x] OpenAPI doc matches the implemented surface; CI checks drift. **Done** —
+      `utoipa` generates the `/v1` spec from the handlers; `GET /v1/openapi.json`
+      serves it; `docs/openapi.yaml` is committed and a drift test
+      (`tests/openapi.rs`) fails (with a regenerate hint) if the handlers/DTOs
+      and the committed spec diverge.
 
 **Errors:** a consistent JSON body `{ "error": "...", "kind": "..." }` is
 produced by `ApiErrorResponse` (`IntoResponse`) using `ApiError::http_status()`
@@ -719,16 +730,33 @@ scopes become RBAC permissions.
       plaintext listener. (No `--insecure` path was added; HTTP is simply not
       served.)
 - [x] Static bearer token; deny-by-default. **Done** (`src/auth.rs`,
-      `src/app.rs::auth_layer`). Every `/v1/*` route except `GET /v1/health`
-      requires `Authorization: Bearer <token>` (WS also accepts `?token=`), with a
-      **constant-time** compare. Missing/wrong → `401` JSON. **Note:** v1 ships a
-      single token (read+write); the read-vs-write **scope split is deferred** to
-      a follow-up (the token is principal-shaped for that upgrade).
+      `src/app.rs` scope middleware). Every `/v1/*` route except `GET /v1/health`
+      and `GET /v1/openapi.json` requires `Authorization: Bearer <token>` (WS also
+      accepts `?token=`), with a **constant-time** compare. Missing/wrong → `401`
+      JSON.
+- [x] **Read vs read-write token scopes** (plan §6.2). **Done.** The read-write
+      token comes from `--token`/`REMUX_GATEWAY_TOKEN`; an optional read-only token
+      from `--read-token`/`REMUX_GATEWAY_READ_TOKEN`. A token→[`Scope`] map
+      (`ReadOnly` | `ReadWrite`) is resolved in constant time per presented token.
+      Read scope may call the safe endpoints (list/inspect/screen/scrollback/wait
+      and the `/events` WS); write scope is required for everything that mutates or
+      injects (create/delete/rename/input/resize and the `/stream` WS). A read-only
+      token on a write route → **403** (distinct from the 401 for an unknown token),
+      enforced **before** the WS upgrade. Deny-by-default throughout. Tested in
+      `tests/scopes_e2e.rs`.
 - [x] Daemon still Unix-socket-only; no code path adds a daemon network listener.
       **Done** — only `remux-gateway` was touched; `remuxd` is unchanged.
-- [x] Audit logging seed: the startup logs a non-reversible `token_id` hash (never
-      the raw token); per-request structured audit lines are a follow-up.
-- [x] OIDC/JWT/mTLS/RBAC + per-token scopes documented as deferred to AW6.
+- [x] **Per-request audit logging.** **Done** (`src/app.rs::audit_layer`). A
+      structured `tracing` line (target `remux_gateway::audit`) is emitted for
+      every `/v1` request with: method, the matched route path (with `{id}`
+      placeholders, not the concrete id), HTTP status, resolved scope, the
+      non-reversible `token_id` hash (never the raw token), client remote address,
+      and latency in ms. WS connect/disconnect are covered by the same layer (the
+      upgrade request is a `/v1` request). No secret material is logged; asserted
+      in `tests/audit_e2e.rs`.
+- [x] OIDC/JWT/mTLS/fine-grained **RBAC** documented as deferred to AW6 (§6.3).
+      v1 ships the coarse read/read-write scope split; scopes upgrade to RBAC
+      permissions and tokens to principals without a redesign.
 
 ---
 
@@ -894,8 +922,9 @@ not a pixel stream.
 
 The agent-native API + fleet differentiator is "delivered (v1)" when:
 
-- [ ] The public `/v1` API exists, is documented (OpenAPI), and is **decoupled**
-      from `remux_core::protocol` (AW0).
+- [x] The public `/v1` API exists, is documented (OpenAPI 3.1 — served at
+      `GET /v1/openapi.json`, committed to `docs/openapi.yaml`), and is
+      **decoupled** from `remux_core::protocol` (AW0).
 - [ ] `remuxd` remains Unix-socket-only; no workstream added a daemon network
       listener (AW1, AW2, AW4 all respect this).
 - [ ] Humans reach remote hosts via `remux --host` / `host:session` over SSH,
@@ -904,8 +933,9 @@ The agent-native API + fleet differentiator is "delivered (v1)" when:
       wait, scrollback (AW2).
 - [ ] Interactive consumers stream over **binary** WebSocket frames; OUTPUT bytes
       are verbatim, non-UTF-8 safe; a structured `/events` channel exists (AW3).
-- [ ] v1 auth = TLS + static bearer (read/write scopes), deny-by-default; daemon
-      local-only (AW4).
+- [x] v1 auth = TLS + static bearer with read/read-write scopes, deny-by-default,
+      per-request audit logging; daemon local-only (AW4). OIDC/mTLS/fine-grained
+      RBAC remain deferred to AW6.
 - [ ] A reference xterm.js consumer exists and is **not** the headline (AW5).
 - [ ] The fleet model is designed and earlier layers are forward-compatible with
       it (AW6).

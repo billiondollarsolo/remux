@@ -1,0 +1,713 @@
+openapi: 3.1.0
+info:
+  title: remux-gateway /v1 API
+  description: Agent-native structured control plane for the remux daemon. The daemon stays Unix-socket-only; this gateway terminates TLS + bearer auth and translates the public /v1 contract onto the local socket.
+  license:
+    name: ''
+  version: 1.0.0
+paths:
+  /v1/health:
+    get:
+      tags:
+      - health
+      summary: '`GET /v1/health` — liveness, no auth.'
+      operationId: health
+      responses:
+        '200':
+          description: Gateway is live
+  /v1/openapi.json:
+    get:
+      tags:
+      - meta
+      summary: |-
+        `GET /v1/openapi.json` — the generated OpenAPI 3.1 document (no auth, for
+        discoverability).
+      operationId: openapi_json
+      responses:
+        '200':
+          description: OpenAPI 3.1 document for the /v1 surface
+  /v1/sessions:
+    get:
+      tags:
+      - sessions
+      summary: '`GET /v1/sessions` — list sessions.'
+      operationId: list_sessions
+      responses:
+        '200':
+          description: All sessions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SessionView'
+        '401':
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+      security:
+      - bearer: []
+    post:
+      tags:
+      - sessions
+      summary: '`POST /v1/sessions` — create a session.'
+      operationId: create_session
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSessionBody'
+        required: true
+      responses:
+        '201':
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionView'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+        '401':
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+        '403':
+          description: Read-only token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+      security:
+      - bearer: []
+  /v1/sessions/{id}:
+    get:
+      tags:
+      - sessions
+      summary: '`GET /v1/sessions/{id}` — inspect a session.'
+      operationId: get_session
+      parameters:
+      - name: id
+        in: path
+        description: Session uuid or name
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Session details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionView'
+        '401':
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+        '404':
+          description: No such session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+      security:
+      - bearer: []
+    delete:
+      tags:
+      - sessions
+      summary: '`DELETE /v1/sessions/{id}` — kill a session.'
+      operationId: delete_session
+      parameters:
+      - name: id
+        in: path
+        description: Session uuid or name
+        required: true
+        schema:
+          type: string
+      - name: signal
+        in: query
+        description: Signal to send (default SIGTERM)
+        required: false
+        schema:
+          type: integer
+          format: int32
+      responses:
+        '204':
+          description: Session killed
+        '401':
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+        '403':
+          description: Read-only token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+        '404':
+          description: No such session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+      security:
+      - bearer: []
+    patch:
+      tags:
+      - sessions
+      summary: '`PATCH /v1/sessions/{id}` — rename a session.'
+      operationId: patch_session
+      parameters:
+      - name: id
+        in: path
+        description: Session uuid or name
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenameBody'
+        required: true
+      responses:
+        '200':
+          description: Updated session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionView'
+        '401':
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+        '403':
+          description: Read-only token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+        '404':
+          description: No such session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+      security:
+      - bearer: []
+  /v1/sessions/{id}/input:
+    post:
+      tags:
+      - sessions
+      summary: '`POST /v1/sessions/{id}/input` — send input (fire-and-forget).'
+      description: |-
+        Body variants (mirroring `cmd/send.rs`'s `InputSource`):
+        - `application/json` with `{ "text": "..." }` (only `\n \t \r \\` interpreted)
+          or `{ "bytes_hex": "1b5b41" }`.
+        - any other content type (e.g. `application/octet-stream`) → the raw body
+          bytes are sent verbatim.
+      operationId: send_input
+      parameters:
+      - name: id
+        in: path
+        description: Session uuid or name
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InputBody'
+        required: true
+      responses:
+        '202':
+          description: Input accepted (fire-and-forget)
+        '400':
+          description: Invalid input body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+        '401':
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+        '403':
+          description: Read-only token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+      security:
+      - bearer: []
+  /v1/sessions/{id}/resize:
+    post:
+      tags:
+      - sessions
+      summary: '`POST /v1/sessions/{id}/resize` — resize the PTY.'
+      description: |-
+        Resize requires being the controlling client (the daemon enforces it), so the
+        gateway briefly attaches as Control over a throwaway connection, issues the
+        resize, and detaches. This may transiently steal control from a live
+        `/stream` attachment (the daemon emits `ControlLost`), which is the intended
+        semantics of an explicit resize request.
+      operationId: resize_session
+      parameters:
+      - name: id
+        in: path
+        description: Session uuid or name
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResizeBody'
+        required: true
+      responses:
+        '200':
+          description: Resized
+        '401':
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+        '403':
+          description: Read-only token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+        '404':
+          description: No such session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+      security:
+      - bearer: []
+  /v1/sessions/{id}/screen:
+    get:
+      tags:
+      - sessions
+      summary: '`GET /v1/sessions/{id}/screen` — capture the screen as structured JSON cells.'
+      operationId: get_screen
+      parameters:
+      - name: id
+        in: path
+        description: Session uuid or name
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Structured screen snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScreenView'
+        '401':
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+        '404':
+          description: No such session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+      security:
+      - bearer: []
+  /v1/sessions/{id}/scrollback:
+    get:
+      tags:
+      - sessions
+      summary: '`GET /v1/sessions/{id}/scrollback?lines=N` — read scrollback as decoded text.'
+      operationId: get_scrollback
+      parameters:
+      - name: id
+        in: path
+        description: Session uuid or name
+        required: true
+        schema:
+          type: string
+      - name: lines
+        in: query
+        description: Max lines (default 1000)
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      responses:
+        '200':
+          description: Scrollback chunk
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScrollbackView'
+        '401':
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+        '404':
+          description: No such session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+      security:
+      - bearer: []
+  /v1/sessions/{id}/wait:
+    post:
+      tags:
+      - sessions
+      summary: '`POST /v1/sessions/{id}/wait` — wait on semantic state.'
+      operationId: wait_session
+      parameters:
+      - name: id
+        in: path
+        description: Session uuid or name
+        required: true
+        schema:
+          type: string
+      - name: timeout_ms
+        in: query
+        description: Overall wait timeout in ms
+        required: false
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WaitBody'
+        required: true
+      responses:
+        '200':
+          description: Wait outcome
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WaitResult'
+        '400':
+          description: Invalid predicate (e.g. bad regex)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+        '401':
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+        '404':
+          description: No such session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorBody'
+      security:
+      - bearer: []
+components:
+  schemas:
+    ApiErrorBody:
+      type: object
+      description: |-
+        The consistent JSON error body the gateway returns on any error
+        (`{ "error": "...", "kind": "..." }`).
+      required:
+      - error
+      - kind
+      properties:
+        error:
+          type: string
+          description: Human-readable message.
+          example: 'not found: no such session'
+        kind:
+          type: string
+          description: |-
+            Stable machine-readable category (e.g. `not_found`, `forbidden`,
+            `bad_request`, `unauthorized`, `daemon_unavailable`).
+          example: not_found
+    CreateSessionBody:
+      type: object
+      description: Request body for `POST /v1/sessions`.
+      required:
+      - command
+      properties:
+        command:
+          type: array
+          items:
+            type: string
+        cwd:
+          type:
+          - string
+          - 'null'
+        env:
+          type: array
+          items:
+            type: array
+            items:
+              type: string
+          description: |-
+            Environment as `[name, value]` pairs (JSON-friendly; avoids a map so
+            duplicate keys / ordering are explicit).
+        name:
+          type:
+          - string
+          - 'null'
+        size:
+          $ref: '#/components/schemas/SizeBody'
+    InputBody:
+      type: object
+      description: |-
+        JSON body for `POST /v1/sessions/{id}/input` (the `application/json` form).
+
+        Exactly one of `text` (with `\n \t \r \\` interpreted) or `bytes_hex`
+        (e.g. `"1b5b41"`). Raw binary may also be POSTed with a non-JSON content type
+        and a raw body. This DTO exists so the input contract is part of the OpenAPI
+        spec; the handler parses the same shape.
+      properties:
+        bytes_hex:
+          type:
+          - string
+          - 'null'
+          description: Hex-encoded raw bytes (e.g. `"1b5b41"` for an up-arrow).
+        text:
+          type:
+          - string
+          - 'null'
+          description: Text input; only `\n \t \r \\` escapes are interpreted.
+          example: echo hello\n
+    RenameBody:
+      type: object
+      description: Request body for `PATCH /v1/sessions/{id}` (rename).
+      required:
+      - name
+      properties:
+        name:
+          type: string
+          example: new-name
+    ResizeBody:
+      type: object
+      description: Request body for `POST /v1/sessions/{id}/resize`.
+      required:
+      - cols
+      - rows
+      properties:
+        cols:
+          type: integer
+          format: int32
+          minimum: 0
+        rows:
+          type: integer
+          format: int32
+          minimum: 0
+    ScreenView:
+      type: object
+      description: 'The structured screen snapshot: grid dimensions, cursor position, alt-screen flag, and the flat per-cell grid. Pinned under /v1 (mirrors remux-core''s TerminalSnapshot).'
+      properties:
+        alternate_screen:
+          type: boolean
+        cells:
+          type: array
+          items:
+            type: object
+            description: 'A single rendered cell: its character plus fg/bg color and SGR attributes (the structured per-cell payload).'
+            properties:
+              bg:
+                type: object
+              bold:
+                type: boolean
+              ch:
+                type: string
+              fg:
+                type: object
+        cols:
+          type: integer
+          format: int32
+        cursor_col:
+          type: integer
+          format: int32
+        cursor_row:
+          type: integer
+          format: int32
+        rows:
+          type: integer
+          format: int32
+    ScrollbackView:
+      type: object
+      description: A chunk of scrollback, as the public contract exposes it.
+      required:
+      - text
+      - lines
+      properties:
+        lines:
+          type: integer
+          minimum: 0
+        text:
+          type: string
+          description: |-
+            Decoded text (lossy UTF-8). Raw-byte access is an AW2 content-type
+            concern; the DTO carries decoded text for the JSON path.
+    SessionView:
+      type: object
+      description: |-
+        Public view of a session (the shape returned by list/create/inspect).
+
+        Independent of `protocol::SessionSummary`/`SessionDetails`: uuid and
+        timestamp are strings, and `status` is a lowercase token.
+      required:
+      - id
+      - name
+      - status
+      - command
+      - cwd
+      - created_at
+      - attached_clients
+      properties:
+        attached_clients:
+          type: integer
+          minimum: 0
+        command:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: string
+          description: RFC3339 timestamp.
+          example: 2026-06-13T18:02:11+00:00
+        cwd:
+          type: string
+        id:
+          type: string
+          description: uuid as string (stable JSON).
+          example: 5f3c0000-0000-0000-0000-000000000000
+        last_exit_code:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        name:
+          type: string
+          example: build
+        pid:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          minimum: 0
+        status:
+          type: string
+          description: '`"running" | "exited" | "starting" | "failed"`.'
+          example: running
+    SizeBody:
+      type: object
+      description: Terminal dimensions in the public contract.
+      required:
+      - cols
+      - rows
+      properties:
+        cols:
+          type: integer
+          format: int32
+          example: 80
+          minimum: 0
+        rows:
+          type: integer
+          format: int32
+          example: 24
+          minimum: 0
+    WaitBody:
+      oneOf:
+      - type: object
+        description: Succeed when no output arrives for `ms` milliseconds.
+        required:
+        - ms
+        - kind
+        properties:
+          kind:
+            type: string
+            enum:
+            - idle
+          ms:
+            type: integer
+            format: int64
+            minimum: 0
+      - type: object
+        description: Succeed when the rolling decoded output buffer matches `pattern`.
+        required:
+        - pattern
+        - kind
+        properties:
+          kind:
+            type: string
+            enum:
+            - regex
+          pattern:
+            type: string
+      - type: object
+        description: Succeed when the session exits (propagating its exit code).
+        required:
+        - kind
+        properties:
+          kind:
+            type: string
+            enum:
+            - exit
+      description: |-
+        Predicate for `POST /v1/sessions/{id}/wait`.
+
+        Tagged on `kind` with `snake_case` variant names, mirroring the CLI's
+        `--idle` / `--for-regex` / `--exit` modes (`cmd/wait.rs`).
+    WaitResult:
+      type: object
+      description: Result of a wait.
+      required:
+      - result
+      properties:
+        exit_code:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        result:
+          type: string
+          description: '`"matched" | "idle" | "exited" | "timeout"`.'
+          example: matched
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+tags:
+- name: sessions
+  description: Session CRUD, input, capture, wait
+- name: health
+  description: Liveness
+- name: meta
+  description: API metadata / discovery
