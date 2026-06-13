@@ -79,23 +79,25 @@ enum Commands {
     },
 }
 
-fn get_socket_path(cli_socket: Option<&str>) -> PathBuf {
-    if let Some(path) = cli_socket {
-        return PathBuf::from(path);
-    }
-
-    // Try config file locations.
+/// Load configuration from the first existing config file location, falling
+/// back to defaults.
+fn load_config() -> Config {
     let config_dirs = [dirs_config_path(), PathBuf::from("/tmp/remux/config.toml")];
     for config_path in &config_dirs {
         if config_path.exists() {
             if let Ok(config) = Config::load(config_path) {
-                return config.daemon.socket_path;
+                return config;
             }
         }
     }
+    Config::default()
+}
 
-    // Default.
-    Config::default().daemon.socket_path
+fn get_socket_path(cli_socket: Option<&str>, config: &Config) -> PathBuf {
+    if let Some(path) = cli_socket {
+        return PathBuf::from(path);
+    }
+    config.daemon.socket_path.clone()
 }
 
 fn dirs_config_path() -> PathBuf {
@@ -119,7 +121,8 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    let socket_path = get_socket_path(cli.socket.as_deref());
+    let config = load_config();
+    let socket_path = get_socket_path(cli.socket.as_deref(), &config);
 
     // Ensure the daemon is running.
     if let Err(e) = daemon_spawn::ensure_daemon_running(&socket_path) {
@@ -140,7 +143,9 @@ async fn main() {
     let result = match cli.command {
         Commands::New { name, command } => cmd::new::run(&mut client, name, command).await,
         Commands::Ls { json, preview } => cmd::ls::run(&mut client, json, preview).await,
-        Commands::Attach { name } => cmd::attach::run(client, name).await,
+        Commands::Attach { name } => {
+            cmd::attach::run(client, name, &config.client.detach_key).await
+        }
         Commands::Inspect { name, json } => cmd::inspect::run(&mut client, name, json).await,
         Commands::Logs { name, lines } => cmd::logs::run(&mut client, name, lines).await,
         Commands::Rename { old_name, new_name } => {

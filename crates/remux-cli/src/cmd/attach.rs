@@ -1,21 +1,27 @@
-use std::io::Write as StdWrite;
+use std::io::{Read as StdRead, Write as StdWrite};
 
-use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers};
 use remux_core::framing::{read_message, write_message};
 use remux_core::{
     AttachMode, ClientId, Event, RemuxError, Request, Response, SessionSelector, TermSize,
 };
 use tokio::io::BufReader;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::mpsc;
 use tokio::task;
 
 use crate::client::RemuxClient;
 use crate::raw_mode::get_terminal_size;
 
 /// Handle the `attach` command.
-pub async fn run(mut client: RemuxClient, name: String) -> Result<(), RemuxError> {
+pub async fn run(
+    mut client: RemuxClient,
+    name: String,
+    detach_key: &str,
+) -> Result<(), RemuxError> {
     let session = parse_selector(&name);
     let size: TermSize = get_terminal_size();
     let client_id = ClientId::new();
+    let detach_byte = parse_detach_byte(detach_key);
 
     // Send attach request.
     let response = client
@@ -76,14 +82,36 @@ pub async fn run(mut client: RemuxClient, name: String) -> Result<(), RemuxError
     let mut daemon_reader = BufReader::new(read_half);
     let mut daemon_writer = write_half;
 
-    // Spawn stdin reader task.
-    let input_handle = task::spawn_blocking(move || -> Result<CrosstermEvent, RemuxError> {
-        crossterm::event::read().map_err(|e| RemuxError::IoError(format!("stdin read error: {e}")))
+    // Spawn a blocking stdin reader. It forwards raw byte chunks over an mpsc
+    // channel so the async loop can scan them for the detach key and relay the
+    // rest verbatim to the PTY.
+    let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
+    task::spawn_blocking(move || {
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        let mut buf = [0u8; 4096];
+        loop {
+            match handle.read(&mut buf) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    if stdin_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        // Receiver dropped; the attach loop has exited.
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
     });
 
-    let mut input_task = input_handle;
+    // SIGWINCH handler: resize is handled out-of-band, not via the byte stream.
+    let mut sigwinch = signal(SignalKind::window_change())
+        .map_err(|e| RemuxError::IoError(format!("failed to install SIGWINCH handler: {e}")))?;
+
     let session_for_input = session.clone();
     let session_for_detach = session.clone();
+    let session_for_resize = session.clone();
     let mut detached = false;
 
     // Line buffer for reading daemon events in JSON mode.
@@ -91,54 +119,43 @@ pub async fn run(mut client: RemuxClient, name: String) -> Result<(), RemuxError
 
     loop {
         tokio::select! {
-            // Handle stdin input events
-            input_result = &mut input_task => {
-                match input_result {
-                    Ok(Ok(event)) => {
-                        match handle_input_event(event) {
-                            InputAction::Forward(bytes) => {
-                                if !bytes.is_empty() {
-                                    let send_req = Request::SendInput {
-                                        session: session_for_input.clone(),
-                                        data: bytes,
-                                    };
-                                    write_message(&mut daemon_writer, &send_req).await?;
-                                }
-                            }
-                            InputAction::Detach => {
-                                let detach_req = Request::DetachSession {
-                                    session: session_for_detach.clone(),
-                                    client_id: client_id.clone(),
-                                };
-                                let _ = write_message(&mut daemon_writer, &detach_req).await;
-                                detached = true;
-                                break;
-                            }
-                            InputAction::Resize(new_size) => {
-                                let resize_req = Request::ResizeSession {
-                                    session: session_for_input.clone(),
-                                    size: new_size,
-                                    client_id: client_id.clone(),
-                                };
-                                let _ = write_message(&mut daemon_writer, &resize_req).await;
-                            }
-                            InputAction::None => {}
+            // Handle raw stdin bytes: forward verbatim, intercepting the detach key.
+            chunk = stdin_rx.recv() => {
+                match chunk {
+                    Some(bytes) => {
+                        let scan = scan_for_detach(&bytes, detach_byte);
+                        if !scan.forward.is_empty() {
+                            let send_req = Request::SendInput {
+                                session: session_for_input.clone(),
+                                data: scan.forward,
+                            };
+                            write_message(&mut daemon_writer, &send_req).await?;
                         }
-                        // Spawn next input read.
-                        input_task = task::spawn_blocking(|| {
-                            crossterm::event::read()
-                                .map_err(|e| RemuxError::IoError(format!("stdin read error: {e}")))
-                        });
+                        if scan.detached {
+                            let detach_req = Request::DetachSession {
+                                session: session_for_detach.clone(),
+                                client_id: client_id.clone(),
+                            };
+                            let _ = write_message(&mut daemon_writer, &detach_req).await;
+                            detached = true;
+                            break;
+                        }
                     }
-                    Ok(Err(e)) => {
-                        let _ = write_to_stdout(format!("\r\n[input error: {e}]\r\n").as_bytes());
-                        break;
-                    }
-                    Err(_) => {
-                        let _ = write_to_stdout(b"\r\n[input task cancelled]\r\n");
+                    None => {
+                        // stdin closed (EOF). Nothing more to forward.
                         break;
                     }
                 }
+            }
+            // Handle terminal resize out-of-band via SIGWINCH.
+            _ = sigwinch.recv() => {
+                let new_size = get_terminal_size();
+                let resize_req = Request::ResizeSession {
+                    session: session_for_resize.clone(),
+                    size: new_size,
+                    client_id: client_id.clone(),
+                };
+                let _ = write_message(&mut daemon_writer, &resize_req).await;
             }
             // Handle daemon events (output from the session)
             event_result = read_message::<Event>(&mut daemon_reader, &mut event_line) => {
@@ -215,90 +232,124 @@ fn parse_selector(name: &str) -> SessionSelector {
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
-/// Result of processing an input event.
-enum InputAction {
-    /// Forward these bytes to the PTY.
-    Forward(Vec<u8>),
-    /// User pressed detach key (Ctrl-Q).
-    Detach,
-    /// Terminal was resized.
-    Resize(TermSize),
-    /// No action needed.
-    None,
-}
-
-/// Handle a single crossterm input event.
-fn handle_input_event(event: CrosstermEvent) -> InputAction {
-    match event {
-        CrosstermEvent::Key(key_event) => {
-            // Check for detach key: Ctrl-Q
-            if key_event.modifiers.contains(KeyModifiers::CONTROL)
-                && key_event.code == KeyCode::Char('q')
-            {
-                return InputAction::Detach;
-            }
-
-            let bytes = encode_key_event(key_event);
-            if bytes.is_empty() {
-                InputAction::None
-            } else {
-                InputAction::Forward(bytes)
-            }
-        }
-        CrosstermEvent::Resize(cols, rows) => InputAction::Resize(TermSize { cols, rows }),
-        _ => InputAction::None,
-    }
-}
-
-/// Encode a crossterm key event into raw bytes for a PTY.
-fn encode_key_event(key: crossterm::event::KeyEvent) -> Vec<u8> {
-    use crossterm::event::KeyCode as KC;
-
-    // Handle ctrl+letter
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        if let KC::Char(c) = key.code {
-            if c.is_ascii_lowercase() && c != 'q' {
-                let byte = (c as u8) - b'a' + 1;
-                return vec![byte];
+/// Parse a detach key string (e.g. "ctrl-q", "ctrl-a") into the raw control
+/// byte the terminal emits for that chord. Unrecognized input falls back to
+/// Ctrl-Q (0x11).
+fn parse_detach_byte(s: &str) -> u8 {
+    const DEFAULT: u8 = 0x11; // Ctrl-Q
+    let s = s.trim().to_ascii_lowercase();
+    if let Some(rest) = s.strip_prefix("ctrl-") {
+        let mut chars = rest.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            if c.is_ascii_lowercase() {
+                return (c as u8) - b'a' + 1;
             }
         }
     }
+    DEFAULT
+}
 
-    match key.code {
-        KC::Enter => vec![b'\r'],
-        KC::Backspace => vec![0x7f],
-        KC::Tab => vec![b'\t'],
-        KC::Esc => vec![0x1b],
-        KC::Up => vec![0x1b, b'[', b'A'],
-        KC::Down => vec![0x1b, b'[', b'B'],
-        KC::Right => vec![0x1b, b'[', b'C'],
-        KC::Left => vec![0x1b, b'[', b'D'],
-        KC::Home => vec![0x1b, b'[', b'H'],
-        KC::End => vec![0x1b, b'[', b'F'],
-        KC::PageUp => vec![0x1b, b'[', b'5', b'~'],
-        KC::PageDown => vec![0x1b, b'[', b'6', b'~'],
-        KC::Delete => vec![0x1b, b'[', b'3', b'~'],
-        KC::Insert => vec![0x1b, b'[', b'2', b'~'],
-        KC::F(1) => vec![0x1b, b'O', b'P'],
-        KC::F(2) => vec![0x1b, b'O', b'Q'],
-        KC::F(3) => vec![0x1b, b'O', b'R'],
-        KC::F(4) => vec![0x1b, b'O', b'S'],
-        KC::F(n) if (5..=12).contains(&n) => {
-            let offset: u8 = if n <= 5 {
-                15
-            } else if n <= 10 {
-                11
-            } else {
-                13
-            };
-            let code = offset + n;
-            vec![0x1b, b'[', code, b'~']
-        }
-        KC::Char(c) => {
-            let mut buf = [0u8; 4];
-            let s = c.encode_utf8(&mut buf);
-            s.as_bytes().to_vec()
-        }
-        _ => Vec::new(),
+/// Result of scanning a raw stdin chunk for the detach byte.
+#[derive(Debug, PartialEq, Eq)]
+struct DetachScan {
+    /// Bytes to forward to the PTY (everything before the detach byte, or the
+    /// whole chunk if the detach byte is absent).
+    forward: Vec<u8>,
+    /// Whether the detach byte was found.
+    detached: bool,
+}
+
+/// Scan a raw stdin chunk for the detach byte. Bytes preceding the detach byte
+/// are forwarded; the detach byte itself (and anything after it in the same
+/// chunk) is consumed. If the detach byte is absent the whole chunk is
+/// forwarded verbatim.
+fn scan_for_detach(chunk: &[u8], detach_byte: u8) -> DetachScan {
+    match chunk.iter().position(|&b| b == detach_byte) {
+        Some(idx) => DetachScan {
+            forward: chunk[..idx].to_vec(),
+            detached: true,
+        },
+        None => DetachScan {
+            forward: chunk.to_vec(),
+            detached: false,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_detach_byte_ctrl_q() {
+        assert_eq!(parse_detach_byte("ctrl-q"), 0x11);
+    }
+
+    #[test]
+    fn parse_detach_byte_ctrl_a() {
+        assert_eq!(parse_detach_byte("ctrl-a"), 0x01);
+    }
+
+    #[test]
+    fn parse_detach_byte_garbage_defaults_to_ctrl_q() {
+        assert_eq!(parse_detach_byte("garbage"), 0x11);
+        assert_eq!(parse_detach_byte(""), 0x11);
+        assert_eq!(parse_detach_byte("ctrl-"), 0x11);
+        assert_eq!(parse_detach_byte("ctrl-ab"), 0x11);
+        assert_eq!(parse_detach_byte("alt-q"), 0x11);
+    }
+
+    #[test]
+    fn parse_detach_byte_case_insensitive_and_trimmed() {
+        assert_eq!(parse_detach_byte("  Ctrl-A  "), 0x01);
+    }
+
+    #[test]
+    fn scan_for_detach_forwards_everything_when_absent() {
+        let chunk = b"hello world";
+        let scan = scan_for_detach(chunk, 0x11);
+        assert_eq!(
+            scan,
+            DetachScan {
+                forward: chunk.to_vec(),
+                detached: false,
+            }
+        );
+    }
+
+    #[test]
+    fn scan_for_detach_splits_on_detach_byte() {
+        // "ab" then Ctrl-Q (0x11) then trailing bytes.
+        let chunk = [b'a', b'b', 0x11, b'c', b'd'];
+        let scan = scan_for_detach(&chunk, 0x11);
+        assert_eq!(
+            scan,
+            DetachScan {
+                forward: vec![b'a', b'b'],
+                detached: true,
+            }
+        );
+    }
+
+    #[test]
+    fn scan_for_detach_detach_byte_at_start() {
+        let chunk = [0x11, b'x'];
+        let scan = scan_for_detach(&chunk, 0x11);
+        assert_eq!(
+            scan,
+            DetachScan {
+                forward: Vec::new(),
+                detached: true,
+            }
+        );
+    }
+
+    #[test]
+    fn scan_for_detach_passes_arbitrary_bytes_unchanged() {
+        // Escape sequences and UTF-8 must survive byte-exact (no detach byte here).
+        let chunk = [0x1b, b'[', b'A', 0xf0, 0x9f, 0x98, 0x80];
+        let scan = scan_for_detach(&chunk, 0x11);
+        assert_eq!(scan.forward, chunk.to_vec());
+        assert!(!scan.detached);
     }
 }
