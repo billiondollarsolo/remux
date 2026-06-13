@@ -70,6 +70,7 @@ trait VariantName {
 impl VariantName for Response {
     fn variant_name(&self) -> &'static str {
         match self {
+            Response::Hello { .. } => "Hello",
             Response::Pong => "Pong",
             Response::Ok => "Ok",
             Response::Error(_) => "Error",

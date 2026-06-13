@@ -595,21 +595,64 @@ impl SessionManager {
     }
 
     /// Broadcast an event to all subscribers of a session.
+    ///
+    /// Backpressure / resync policy: when a subscriber's channel is `Full`, the
+    /// client is lagging and would otherwise miss this event, silently
+    /// corrupting its screen. Instead of dropping the event, we send a fresh
+    /// `Event::StateSnapshot` built from the session's current `VtState` so the
+    /// client can repaint and self-heal once it drains its backlog. The
+    /// snapshot is only built on the `Full` path — never on the normal hot path.
+    /// If the channel is still full even for the snapshot, we keep the
+    /// subscriber (best-effort) and record a warning. `Closed` -> drop.
     pub fn broadcast_event(&mut self, session_id: &SessionId, event: Event) {
         if let Some(session) = self.sessions.get_mut(session_id) {
-            session
-                .subscribers
-                .retain(|tx| match tx.try_send(event.clone()) {
-                    Ok(()) => true,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        tracing::warn!(
-                            session_id = %session_id.0,
-                            "subscriber channel full, dropping event"
-                        );
-                        true
+            // Split the session borrow so the `retain` closure can mutate the
+            // subscriber list while still reading the VT for a resync snapshot.
+            let subscribers = &mut session.subscribers;
+            let vt = &session.vt;
+            let last_size = session.last_size;
+
+            // Lazily built only when at least one subscriber is full, so the
+            // (potentially expensive) snapshot is never produced on the normal
+            // hot path. Built from the live VT in this same locked session
+            // struct — no second lock acquisition.
+            let mut resync: Option<Event> = None;
+            subscribers.retain(|tx| match tx.try_send(event.clone()) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    let snapshot_event = resync.get_or_insert_with(|| Event::StateSnapshot {
+                        session: session_id.clone(),
+                        snapshot: vt.as_ref().map(|vt| vt.snapshot()).unwrap_or_else(|| {
+                            TerminalSnapshot {
+                                cols: last_size.cols,
+                                rows: last_size.rows,
+                                cells: Vec::new(),
+                                cursor_row: 0,
+                                cursor_col: 0,
+                                alternate_screen: false,
+                            }
+                        }),
+                    });
+                    match tx.try_send(snapshot_event.clone()) {
+                        Ok(()) => {
+                            tracing::warn!(
+                                session_id = %session_id.0,
+                                "subscriber lagging, sent resync snapshot"
+                            );
+                            true
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(
+                                session_id = %session_id.0,
+                                "subscriber channel full even for resync snapshot, keeping subscriber"
+                            );
+                            true
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => false,
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => false,
-                });
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            });
         }
     }
 

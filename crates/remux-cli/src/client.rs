@@ -16,10 +16,29 @@ impl RemuxClient {
         let stream = UnixStream::connect(socket_path).await.map_err(|e| {
             RemuxError::ConnectionFailed(format!("failed to connect to daemon: {e}"))
         })?;
-        Ok(Self {
+        let mut client = Self {
             stream,
             line_buf: Vec::new(),
-        })
+        };
+        client.handshake().await?;
+        Ok(client)
+    }
+
+    /// Perform the lenient protocol handshake: send `Hello` with our protocol
+    /// version and read (and discard) the daemon's reply. A version mismatch is
+    /// reported by the daemon as `Response::Error`.
+    async fn handshake(&mut self) -> Result<(), RemuxError> {
+        write_message(
+            &mut self.stream,
+            &Request::Hello {
+                version: remux_core::PROTOCOL_VERSION,
+            },
+        )
+        .await?;
+        match read_message::<Response>(&mut self.stream, &mut self.line_buf).await? {
+            Some(Response::Error(e)) => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// Send a request and receive a single response.

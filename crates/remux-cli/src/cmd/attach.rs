@@ -184,6 +184,7 @@ pub async fn run(
                                 let _ = write_to_stdout(&painted);
                             }
                             Event::SessionUpdated(_) => {}
+                            Event::SessionTerminating { session: _ } => {}
                         }
                     }
                     Ok(None) => {

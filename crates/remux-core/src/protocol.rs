@@ -52,6 +52,13 @@ pub struct CreateSessionRequest {
 /// IPC request envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
+    /// Optional, lenient protocol handshake. If sent, it must be the FIRST
+    /// message on the connection; the daemon validates `version` against
+    /// `PROTOCOL_VERSION` and rejects a mismatch. Clients are not required to
+    /// send it.
+    Hello {
+        version: u32,
+    },
     Ping,
     ListSessions,
     CreateSession(CreateSessionRequest),
@@ -142,6 +149,10 @@ pub struct ScrollbackChunk {
 /// IPC response envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
+    /// Reply to a `Hello` handshake, echoing the daemon's protocol version.
+    Hello {
+        version: u32,
+    },
     Pong,
     Ok,
     Error(RemuxError),
@@ -168,6 +179,13 @@ pub enum Event {
     SessionExited {
         session: SessionId,
         exit_code: Option<i32>,
+    },
+    /// Sent when a session has been asked to terminate (e.g. via `KillSession`)
+    /// but the process has not yet exited. This is purely informational; the
+    /// authoritative `SessionExited` (with the real exit code) follows once the
+    /// PTY pump observes the process death.
+    SessionTerminating {
+        session: SessionId,
     },
     ControlLost {
         session: SessionId,
@@ -214,6 +232,62 @@ mod tests {
     }
 
     // --- JSON roundtrip tests ---
+
+    #[test]
+    fn request_hello_json_roundtrip() {
+        let req = Request::Hello {
+            version: PROTOCOL_VERSION,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: Request = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(back, Request::Hello { version } if version == PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn request_hello_bincode_roundtrip() {
+        let req = Request::Hello { version: 7 };
+        let bytes = bincode::serialize(&req).expect("serialize");
+        let back: Request = bincode::deserialize(&bytes).expect("deserialize");
+        assert!(matches!(back, Request::Hello { version: 7 }));
+    }
+
+    #[test]
+    fn response_hello_json_roundtrip() {
+        let resp = Response::Hello {
+            version: PROTOCOL_VERSION,
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        let back: Response = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(back, Response::Hello { version } if version == PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn response_hello_bincode_roundtrip() {
+        let resp = Response::Hello { version: 42 };
+        let bytes = bincode::serialize(&resp).expect("serialize");
+        let back: Response = bincode::deserialize(&bytes).expect("deserialize");
+        assert!(matches!(back, Response::Hello { version: 42 }));
+    }
+
+    #[test]
+    fn event_session_terminating_json_roundtrip() {
+        let ev = Event::SessionTerminating {
+            session: sample_session_id(),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        let back: Event = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(back, Event::SessionTerminating { .. }));
+    }
+
+    #[test]
+    fn event_session_terminating_bincode_roundtrip() {
+        let ev = Event::SessionTerminating {
+            session: sample_session_id(),
+        };
+        let bytes = bincode::serialize(&ev).expect("serialize");
+        let back: Event = bincode::deserialize(&bytes).expect("deserialize");
+        assert!(matches!(back, Event::SessionTerminating { .. }));
+    }
 
     #[test]
     fn request_ping_json_roundtrip() {

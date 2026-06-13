@@ -612,7 +612,12 @@ the eager broadcast; rely on the pump's authoritative `SessionExited` with the
 true code. If clients need instant feedback, send a distinct
 `Event::SessionTerminating` instead of a fake exit.
 
-#### T5.2 — Per-session locking (F11)
+#### T5.2 — Per-session locking (F11) — **DEFERRED**
+
+> **Deferred (performance, not correctness):** This is a contention/throughput
+> optimization with no behavioral or wire-format impact, so it is intentionally
+> deferred rather than risk a large lock refactor; the global `Mutex` is left
+> as-is and all WS5 correctness items land independently.
 
 The single `Mutex<SessionManager>` (`daemon.rs:17`) is locked on **every** PTY
 output chunk (`daemon.rs:374-384`) and the whole map is iterated on every client
@@ -660,7 +665,7 @@ loses output → corrupted screen. Decide policy: either (a) coalesce to a
 ### 7.3 Definition of Done
 
 - [ ] No duplicate/fake `SessionExited`.
-- [ ] PTY pump no longer contends on a global lock for steady-state output.
+- [ ] ~~PTY pump no longer contends on a global lock for steady-state output.~~ (T5.2 deferred — perf, not correctness)
 - [ ] Disconnect cleanup is O(attached sessions).
 - [ ] Protocol version handshake in place.
 - [ ] Documented, tested backpressure/resync policy.

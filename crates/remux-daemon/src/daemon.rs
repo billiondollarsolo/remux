@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -113,6 +114,14 @@ async fn handle_client(
     // Persistent line buffer for framed reads
     let mut line_buf: Vec<u8> = Vec::new();
 
+    // Sessions this connection has attached to. Used to make disconnect cleanup
+    // O(attached) instead of iterating every session in the registry.
+    let attached_sessions: Arc<tokio::sync::Mutex<HashSet<SessionId>>> =
+        Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+
+    // Whether we are still expecting a possible opening `Hello` handshake.
+    let mut is_first_request = true;
+
     // Main request loop
     loop {
         let request = match framing::read_message::<Request>(&mut read_half, &mut line_buf).await {
@@ -127,8 +136,43 @@ async fn handle_client(
             }
         };
 
-        let (response, event_rx) =
+        // Intercept an opening `Hello` handshake. It is lenient: only the FIRST
+        // message is treated as a handshake, and clients are not required to
+        // send one. A version mismatch is a hard error and closes the
+        // connection.
+        if is_first_request {
+            is_first_request = false;
+            if let Request::Hello { version } = request {
+                let resp = if version == remux_core::PROTOCOL_VERSION {
+                    Response::Hello {
+                        version: remux_core::PROTOCOL_VERSION,
+                    }
+                } else {
+                    Response::Error(RemuxError::ProtocolError(format!(
+                        "protocol version mismatch: client {version}, daemon {}",
+                        remux_core::PROTOCOL_VERSION
+                    )))
+                };
+                let mismatch = !matches!(resp, Response::Hello { .. });
+                if let Ok(bytes) = framing::serialize_to_bytes(&resp) {
+                    let _ = write_tx.send(bytes).await;
+                }
+                if mismatch {
+                    tracing::warn!(client_id = ?client_id, "rejecting client: protocol mismatch");
+                    break;
+                }
+                continue;
+            }
+        }
+
+        let (response, event_rx, attached) =
             process_request_with_events(&client_id, request, &sessions).await;
+
+        // Record the session this connection attached to, so disconnect cleanup
+        // is O(attached) rather than O(total sessions).
+        if let Some(sid) = attached {
+            attached_sessions.lock().await.insert(sid);
+        }
 
         // Send the response to the client (if any)
         if let Some(resp) = response {
@@ -144,6 +188,7 @@ async fn handle_client(
             let write_tx_clone = write_tx.clone();
             let fwd_client_id = client_id.clone();
             let fwd_sessions = sessions.clone();
+            let fwd_attached = attached_sessions.clone();
             tokio::spawn(async move {
                 while let Some(event) = rx.recv().await {
                     if let Ok(bytes) = framing::serialize_to_bytes(&event) {
@@ -152,7 +197,7 @@ async fn handle_client(
                         }
                     }
                 }
-                detach_client_from_all_sessions(&fwd_client_id, &fwd_sessions).await;
+                detach_tracked_sessions(&fwd_client_id, &fwd_sessions, &fwd_attached).await;
             });
         }
     }
@@ -160,20 +205,32 @@ async fn handle_client(
     // Clean up
     drop(write_tx);
     let _ = writer_handle.await;
-    detach_client_from_all_sessions(&client_id, &sessions).await;
+    detach_tracked_sessions(&client_id, &sessions, &attached_sessions).await;
 
     Ok(())
 }
 
-/// Detach a client from all sessions it was attached to.
-async fn detach_client_from_all_sessions(client_id: &ClientId, sessions: &SharedSessionManager) {
-    let sessions_list: Vec<SessionId> = {
-        let mgr = sessions.lock().await;
-        mgr.list_sessions().into_iter().map(|s| s.id).collect()
+/// Detach a client from only the sessions it actually attached to.
+///
+/// O(attached) rather than O(total sessions): we iterate the connection-local
+/// set of attached session ids instead of the whole registry. Ids are removed
+/// from the set as they are detached so a later cleanup pass is a no-op.
+async fn detach_tracked_sessions(
+    client_id: &ClientId,
+    sessions: &SharedSessionManager,
+    attached_sessions: &Arc<tokio::sync::Mutex<HashSet<SessionId>>>,
+) {
+    let to_detach: Vec<SessionId> = {
+        let mut set = attached_sessions.lock().await;
+        set.drain().collect()
     };
 
-    for sid in sessions_list {
-        let mut mgr = sessions.lock().await;
+    if to_detach.is_empty() {
+        return;
+    }
+
+    let mut mgr = sessions.lock().await;
+    for sid in to_detach {
         let selector = SessionSelector::Id(sid);
         let _ = mgr.detach_session(&selector, client_id);
     }
@@ -187,13 +244,27 @@ async fn process_request_with_events(
     client_id: &ClientId,
     request: Request,
     sessions: &SharedSessionManager,
-) -> (Option<Response>, Option<tokio::sync::mpsc::Receiver<Event>>) {
+) -> (
+    Option<Response>,
+    Option<tokio::sync::mpsc::Receiver<Event>>,
+    Option<SessionId>,
+) {
     match request {
-        Request::Ping => (Some(Response::Pong), None),
+        // `Hello` is handled by the handshake path in `handle_client`; if it
+        // arrives here (not as the first message) treat it as a no-op ack.
+        Request::Hello { version: _ } => (
+            Some(Response::Hello {
+                version: remux_core::PROTOCOL_VERSION,
+            }),
+            None,
+            None,
+        ),
+
+        Request::Ping => (Some(Response::Pong), None, None),
 
         Request::ListSessions => {
             let mgr = sessions.lock().await;
-            (Some(Response::SessionList(mgr.list_sessions())), None)
+            (Some(Response::SessionList(mgr.list_sessions())), None, None)
         }
 
         Request::CreateSession(req) => {
@@ -201,17 +272,17 @@ async fn process_request_with_events(
             match mgr.create_session(req) {
                 Ok((session_id, details)) => {
                     spawn_pty_pump(session_id, sessions.clone());
-                    (Some(Response::Created(details)), None)
+                    (Some(Response::Created(details)), None, None)
                 }
-                Err(e) => (Some(Response::Error(e)), None),
+                Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
 
         Request::InspectSession { session } => {
             let mgr = sessions.lock().await;
             match mgr.inspect_session(&session) {
-                Ok(details) => (Some(Response::SessionDetails(details)), None),
-                Err(e) => (Some(Response::Error(e)), None),
+                Ok(details) => (Some(Response::SessionDetails(details)), None, None),
+                Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
 
@@ -223,8 +294,13 @@ async fn process_request_with_events(
         } => {
             let mut mgr = sessions.lock().await;
             match mgr.attach_session(&session, size, mode, client_id.clone()) {
-                Ok((bootstrap, rx)) => (Some(Response::Attached(bootstrap)), Some(rx)),
-                Err(e) => (Some(Response::Error(e)), None),
+                Ok((bootstrap, rx)) => {
+                    // Record the resolved id so disconnect cleanup is
+                    // O(attached) rather than O(total sessions).
+                    let sid = mgr.resolve_selector(&session).ok();
+                    (Some(Response::Attached(bootstrap)), Some(rx), sid)
+                }
+                Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
 
@@ -234,8 +310,8 @@ async fn process_request_with_events(
         } => {
             let mut mgr = sessions.lock().await;
             match mgr.detach_session(&session, client_id) {
-                Ok(()) => (Some(Response::Ok), None),
-                Err(e) => (Some(Response::Error(e)), None),
+                Ok(()) => (Some(Response::Ok), None, None),
+                Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
 
@@ -246,8 +322,8 @@ async fn process_request_with_events(
         } => {
             let mut mgr = sessions.lock().await;
             match mgr.resize_session(&session, size, client_id) {
-                Ok(()) => (Some(Response::Ok), None),
-                Err(e) => (Some(Response::Error(e)), None),
+                Ok(()) => (Some(Response::Ok), None, None),
+                Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
 
@@ -255,32 +331,32 @@ async fn process_request_with_events(
             let mut mgr = sessions.lock().await;
             // Only the controlling client may send input
             match mgr.send_input_for_client(&session, data, client_id) {
-                Ok(()) => (None, None),
-                Err(e) => (Some(Response::Error(e)), None),
+                Ok(()) => (None, None, None),
+                Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
 
         Request::ReadScrollback { session, lines } => {
             let mgr = sessions.lock().await;
             match mgr.read_scrollback(&session, lines) {
-                Ok(chunk) => (Some(Response::Scrollback(chunk)), None),
-                Err(e) => (Some(Response::Error(e)), None),
+                Ok(chunk) => (Some(Response::Scrollback(chunk)), None, None),
+                Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
 
         Request::RenameSession { session, new_name } => {
             let mut mgr = sessions.lock().await;
             match mgr.rename_session(&session, new_name) {
-                Ok(()) => (Some(Response::Ok), None),
-                Err(e) => (Some(Response::Error(e)), None),
+                Ok(()) => (Some(Response::Ok), None, None),
+                Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
 
         Request::CaptureScreen { session } => {
             let mgr = sessions.lock().await;
             match mgr.capture_screen(&session) {
-                Ok(snapshot) => (Some(Response::Screen(snapshot)), None),
-                Err(e) => (Some(Response::Error(e)), None),
+                Ok(snapshot) => (Some(Response::Screen(snapshot)), None, None),
+                Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
 
@@ -293,18 +369,21 @@ async fn process_request_with_events(
             let mut mgr = sessions.lock().await;
             match mgr.kill_session(&session, signal) {
                 Ok(()) => {
+                    // Do NOT broadcast a fake `SessionExited` here: the PTY pump
+                    // emits the authoritative one (with the real exit code) when
+                    // the process actually dies. Send only an informational
+                    // `SessionTerminating` so clients get instant feedback.
                     if let Some(ref id) = sid {
                         mgr.broadcast_event(
                             id,
-                            Event::SessionExited {
+                            Event::SessionTerminating {
                                 session: id.clone(),
-                                exit_code: None,
                             },
                         );
                     }
-                    (Some(Response::Ok), None)
+                    (Some(Response::Ok), None, None)
                 }
-                Err(e) => (Some(Response::Error(e)), None),
+                Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
     }
