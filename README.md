@@ -10,7 +10,39 @@ crash-resilient scrollback that survives a daemon restart.
 Remux is a tmux alternative built in Rust. A background daemon (`remuxd`) owns PTY
 processes and exposes session management over a Unix domain socket. The CLI
 (`remux`) communicates with the daemon to create, list, attach to, and manage
-sessions. A terminal UI (`remux-tui`) provides an interactive session browser.
+sessions. A terminal UI (`remux ui`) provides an interactive session browser.
+
+## Why remux over tmux?
+
+remux keeps tmux's best trait — sessions that outlive your terminal — and
+rethinks the rest around a **protocol-first runtime** instead of a
+screen-scraping control mode. Concretely:
+
+| Capability | tmux | remux |
+|------------|------|-------|
+| Sessions persist across disconnect | ✅ | ✅ |
+| Survives the **server/daemon restart** | ❌ server death loses everything | ✅ scrollback + metadata persisted; sessions recovered as `Exited` for inspection |
+| Structured control API | control mode / text scraping | typed IPC protocol with a versioned handshake |
+| Machine-readable output | limited | `--json` on `ls` / `inspect` / `peek` / `wait` / `new` |
+| Headless input injection | `send-keys` (quoting & escape hazards) | `remux send` — binary-safe `--text` / `--bytes-hex` / `--key` / `--stdin`, without stealing control |
+| Read the current screen programmatically | `capture-pane` (text only) | `remux peek` — plain text, **ANSI color**, or JSON `TerminalSnapshot` |
+| Wait on session state | ❌ (poll it yourself) | `remux wait --idle / --for-regex / --exit` with a real `--timeout` |
+| Exit codes scripts can branch on | mostly `0/1` | `0` ok · `3` not found · `4` timeout · `5` denied · `6` daemon down |
+| Faithful reattach of full-screen apps | ✅ | ✅ repaints from parsed VT state (color, cursor, alt-screen) |
+| Detached terminal-query answering | n/a | ✅ daemon answers DA / cursor-position reports so a backgrounded TUI never hangs |
+| Input transparency | layered key handling | raw byte passthrough (modifiers, paste, mouse, UTF-8) |
+| Multiple clients on one session | shared | controller + **read-only observers** (`remux attach --read-only`) |
+| Implementation | C | Rust (memory-safe); single daemon + thin client |
+
+The payoff is a session runtime that's **scriptable and agent-friendly by
+design**: an AI agent or CI job can `new` a session, `send` keystrokes, `wait`
+for it to go idle or match a pattern, `peek` the screen as JSON, and branch on
+exit codes — no TTY, no control-mode parsing.
+
+**Scope note:** remux deliberately does *not* do in-terminal splits/panes — you
+run multiple first-class sessions and switch between them (`remux ui`) rather
+than tiling one window. If you need split layouts inside a single pane, tmux
+still wins there.
 
 ## Architecture
 
