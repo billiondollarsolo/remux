@@ -78,6 +78,7 @@ impl VariantName for Response {
             Response::Created(_) => "Created",
             Response::Attached(_) => "Attached",
             Response::Scrollback(_) => "Scrollback",
+            Response::Screen(_) => "Screen",
         }
     }
 }

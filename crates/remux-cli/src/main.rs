@@ -77,6 +77,42 @@ enum Commands {
         #[arg(long)]
         stdin: bool,
     },
+    /// Capture and render a session's current screen
+    Peek {
+        /// Session name or ID
+        name: String,
+        /// Output the snapshot as pretty-printed JSON
+        #[arg(long, conflicts_with = "ansi")]
+        json: bool,
+        /// Render with SGR color/attributes preserved (safe to pipe)
+        #[arg(long)]
+        ansi: bool,
+    },
+    /// Block until a session satisfies a predicate
+    #[command(group(
+        clap::ArgGroup::new("predicate")
+            .required(true)
+            .args(["idle", "for_regex", "exit"]),
+    ))]
+    Wait {
+        /// Session name or ID
+        name: String,
+        /// Succeed when no output arrives for this duration (e.g. 500ms, 2s, 1m)
+        #[arg(long)]
+        idle: Option<String>,
+        /// Succeed when output matches this regex
+        #[arg(long = "for-regex")]
+        for_regex: Option<String>,
+        /// Succeed when the session exits (process exits with the child's code)
+        #[arg(long)]
+        exit: bool,
+        /// Overall timeout (e.g. 30s); on expiry the process exits with code 4
+        #[arg(long)]
+        timeout: Option<String>,
+        /// Emit the outcome as JSON: {"result":...,"exit_code":N}
+        #[arg(long)]
+        json: bool,
+    },
     /// Show session details
     Inspect {
         /// Session name or ID
@@ -199,6 +235,60 @@ async fn main() {
                 unreachable!("clap ArgGroup guarantees an input source is present")
             };
             cmd::send::run(&mut client, name, source).await
+        }
+        Commands::Peek { name, json, ansi } => {
+            let format = if json {
+                cmd::peek::PeekFormat::Json
+            } else if ansi {
+                cmd::peek::PeekFormat::Ansi
+            } else {
+                cmd::peek::PeekFormat::Text
+            };
+            cmd::peek::run(&mut client, name, format).await
+        }
+        Commands::Wait {
+            name,
+            idle,
+            for_regex,
+            exit,
+            timeout,
+            json,
+        } => {
+            // Resolve the predicate (clap's ArgGroup guarantees exactly one).
+            let predicate = if let Some(idle_str) = idle {
+                match cmd::wait::parse_duration(&idle_str) {
+                    Some(d) => cmd::wait::WaitPredicate::Idle(d),
+                    None => {
+                        eprintln!("error: invalid --idle duration: {idle_str:?}");
+                        process::exit(1);
+                    }
+                }
+            } else if let Some(re) = for_regex {
+                cmd::wait::WaitPredicate::ForRegex(re)
+            } else if exit {
+                cmd::wait::WaitPredicate::Exit
+            } else {
+                unreachable!("clap ArgGroup guarantees a predicate is present")
+            };
+
+            let timeout_dur = match timeout {
+                Some(t) => match cmd::wait::parse_duration(&t) {
+                    Some(d) => Some(d),
+                    None => {
+                        eprintln!("error: invalid --timeout duration: {t:?}");
+                        process::exit(1);
+                    }
+                },
+                None => None,
+            };
+
+            match cmd::wait::run(client, name, predicate, timeout_dur, json).await {
+                Ok(code) => process::exit(code),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(exit::exit_code_for(&e));
+                }
+            }
         }
         Commands::Inspect { name, json } => cmd::inspect::run(&mut client, name, json).await,
         Commands::Logs { name, lines } => cmd::logs::run(&mut client, name, lines).await,

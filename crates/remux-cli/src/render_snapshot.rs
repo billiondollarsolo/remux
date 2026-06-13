@@ -73,6 +73,81 @@ pub fn paint_snapshot(snap: &TerminalSnapshot) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// Render a snapshot as plain text: each row is its cells' `ch` joined, with
+/// trailing blank cells trimmed, and rows joined by `\n`. No escape sequences
+/// are emitted, so this is safe for scripting and matching.
+pub fn snapshot_to_text(snap: &TerminalSnapshot) -> String {
+    let cols = snap.cols as usize;
+    let rows = snap.rows as usize;
+    let mut out = String::new();
+
+    for row in 0..rows {
+        if row > 0 {
+            out.push('\n');
+        }
+        let row_start = row * cols;
+        let row_cells = &snap.cells[row_start..row_start + cols];
+
+        // Trim trailing blank cells so we don't emit full-width padding.
+        let last = row_cells.iter().rposition(|c| c.ch != ' ');
+        if let Some(idx) = last {
+            for cell in &row_cells[..=idx] {
+                out.push(cell.ch);
+            }
+        }
+    }
+
+    out
+}
+
+/// Render a snapshot as text decorated with SGR color/attribute runs. Like
+/// `snapshot_to_text`, but each run of identically-styled cells is wrapped in
+/// an SGR escape, and each line ends with a reset (`\x1b[0m`). Crucially this
+/// emits NO cursor-movement or clear sequences, so it is safe to pipe.
+pub fn snapshot_to_ansi(snap: &TerminalSnapshot) -> String {
+    let cols = snap.cols as usize;
+    let rows = snap.rows as usize;
+    let mut out = String::new();
+
+    for row in 0..rows {
+        if row > 0 {
+            out.push('\n');
+        }
+        let row_start = row * cols;
+        let row_cells = &snap.cells[row_start..row_start + cols];
+
+        // Trim trailing blank cells so we don't emit full-width padding.
+        let last = row_cells.iter().rposition(|c| !is_blank(c));
+        let painted = match last {
+            Some(idx) => &row_cells[..=idx],
+            None => &[][..],
+        };
+
+        if painted.is_empty() {
+            continue;
+        }
+
+        // Walk cells, coalescing runs with identical SGR state.
+        let mut run_start = 0;
+        while run_start < painted.len() {
+            let mut run_end = run_start + 1;
+            while run_end < painted.len() && same_sgr(&painted[run_start], &painted[run_end]) {
+                run_end += 1;
+            }
+            out.push_str(&sgr_for(&painted[run_start]));
+            for cell in &painted[run_start..run_end] {
+                out.push(cell.ch);
+            }
+            run_start = run_end;
+        }
+
+        // Reset SGR at end of each line so attributes never bleed.
+        out.push_str("\x1b[0m");
+    }
+
+    out
+}
+
 /// A blank cell: a space with default colors and no attributes.
 fn is_blank(c: &CellData) -> bool {
     c.ch == ' '
@@ -180,6 +255,73 @@ mod tests {
             reverse: false,
             strikethrough: false,
         }
+    }
+
+    #[test]
+    fn text_trims_trailing_blanks() {
+        // 5 cols x 2 rows: "Hi" + 3 blanks on row 0; "ok" + blanks on row 1.
+        let mut cells = vec![blank(); 10];
+        cells[0].ch = 'H';
+        cells[1].ch = 'i';
+        cells[5].ch = 'o';
+        cells[6].ch = 'k';
+        let snap = TerminalSnapshot {
+            cols: 5,
+            rows: 2,
+            cells,
+            cursor_row: 0,
+            cursor_col: 0,
+            alternate_screen: false,
+        };
+        assert_eq!(snapshot_to_text(&snap), "Hi\nok");
+    }
+
+    #[test]
+    fn text_blank_row_is_empty_line() {
+        // 3 cols x 2 rows, all blank.
+        let snap = TerminalSnapshot {
+            cols: 3,
+            rows: 2,
+            cells: vec![blank(); 6],
+            cursor_row: 0,
+            cursor_col: 0,
+            alternate_screen: false,
+        };
+        assert_eq!(snapshot_to_text(&snap), "\n");
+    }
+
+    #[test]
+    fn ansi_contains_sgr_for_colored_cell() {
+        // 3 cols x 1 row: red bold 'X' then blanks.
+        let mut cells = vec![blank(); 3];
+        cells[0] = CellData {
+            ch: 'X',
+            fg: CellColor::Indexed(1),
+            bg: CellColor::Default,
+            bold: true,
+            dim: false,
+            italic: false,
+            underline: false,
+            reverse: false,
+            strikethrough: false,
+        };
+        let snap = TerminalSnapshot {
+            cols: 3,
+            rows: 1,
+            cells,
+            cursor_row: 0,
+            cursor_col: 0,
+            alternate_screen: false,
+        };
+        let s = snapshot_to_ansi(&snap);
+        // SGR for red bold (foreground 31), then the char, then a reset.
+        assert!(s.contains("\x1b[0;1;31;49m"));
+        assert!(s.contains('X'));
+        assert!(s.ends_with("\x1b[0m"));
+        // No cursor-movement or clear sequences (safe to pipe).
+        assert!(!s.contains("\x1b[2J"));
+        assert!(!s.contains("H\x1b["));
+        assert!(!s.contains(";1H"));
     }
 
     #[test]

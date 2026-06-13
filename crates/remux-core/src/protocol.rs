@@ -89,6 +89,9 @@ pub enum Request {
         session: SessionSelector,
         signal: Option<i32>,
     },
+    CaptureScreen {
+        session: SessionSelector,
+    },
 }
 
 /// Summary of a session (used in listings).
@@ -147,6 +150,7 @@ pub enum Response {
     Created(SessionDetails),
     Attached(AttachBootstrap),
     Scrollback(ScrollbackChunk),
+    Screen(TerminalSnapshot),
 }
 
 /// Server-pushed event.
@@ -186,6 +190,27 @@ mod tests {
 
     fn sample_client_id() -> ClientId {
         ClientId::new()
+    }
+
+    fn sample_snapshot() -> TerminalSnapshot {
+        TerminalSnapshot {
+            cols: 80,
+            rows: 24,
+            cells: vec![CellData {
+                ch: 'A',
+                fg: CellColor::Rgb(255, 0, 0),
+                bg: CellColor::Default,
+                bold: true,
+                dim: false,
+                italic: false,
+                underline: false,
+                reverse: false,
+                strikethrough: false,
+            }],
+            cursor_row: 1,
+            cursor_col: 2,
+            alternate_screen: false,
+        }
     }
 
     // --- JSON roundtrip tests ---
@@ -255,6 +280,30 @@ mod tests {
         let back: Request = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(
             serde_json::to_string(&req).unwrap(),
+            serde_json::to_string(&back).unwrap()
+        );
+    }
+
+    #[test]
+    fn request_capture_screen_json_roundtrip() {
+        let req = Request::CaptureScreen {
+            session: SessionSelector::Name("my-session".to_string()),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: Request = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            serde_json::to_string(&back).unwrap()
+        );
+    }
+
+    #[test]
+    fn response_screen_json_roundtrip() {
+        let resp = Response::Screen(sample_snapshot());
+        let json = serde_json::to_string(&resp).expect("serialize");
+        let back: Response = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            serde_json::to_string(&resp).unwrap(),
             serde_json::to_string(&back).unwrap()
         );
     }
@@ -411,6 +460,30 @@ mod tests {
         let back: Request = bincode::deserialize(&bytes).expect("deserialize");
         assert_eq!(
             bincode::serialize(&req).unwrap(),
+            bincode::serialize(&back).unwrap()
+        );
+    }
+
+    #[test]
+    fn request_capture_screen_bincode_roundtrip() {
+        let req = Request::CaptureScreen {
+            session: SessionSelector::Id(sample_session_id()),
+        };
+        let bytes = bincode::serialize(&req).expect("serialize");
+        let back: Request = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(
+            bincode::serialize(&req).unwrap(),
+            bincode::serialize(&back).unwrap()
+        );
+    }
+
+    #[test]
+    fn response_screen_bincode_roundtrip() {
+        let resp = Response::Screen(sample_snapshot());
+        let bytes = bincode::serialize(&resp).expect("serialize");
+        let back: Response = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(
+            bincode::serialize(&resp).unwrap(),
             bincode::serialize(&back).unwrap()
         );
     }

@@ -276,6 +276,14 @@ async fn process_request_with_events(
             }
         }
 
+        Request::CaptureScreen { session } => {
+            let mgr = sessions.lock().await;
+            match mgr.capture_screen(&session) {
+                Ok(snapshot) => (Some(Response::Screen(snapshot)), None),
+                Err(e) => (Some(Response::Error(e)), None),
+            }
+        }
+
         Request::KillSession { session, signal } => {
             let sid = {
                 let mgr = sessions.lock().await;

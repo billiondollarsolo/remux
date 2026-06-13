@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 use remux_core::{
     AttachBootstrap, AttachMode, ClientId, Config, CreateSessionRequest, Event, RemuxError,
     ScrollbackChunk, SessionDetails, SessionId, SessionSelector, SessionStatus, SessionSummary,
-    TermSize,
+    TermSize, TerminalSnapshot,
 };
 
 use crate::persistence;
@@ -528,6 +528,24 @@ impl SessionManager {
         Ok(ScrollbackChunk {
             data,
             lines: line_data.len(),
+        })
+    }
+
+    /// Capture the current screen of a session as a `TerminalSnapshot`.
+    ///
+    /// Resolves the session and returns a snapshot of its live VT state. Errors
+    /// if the session is unknown or has no VT (e.g. an exited session whose VT
+    /// has been torn down).
+    pub fn capture_screen(
+        &self,
+        selector: &SessionSelector,
+    ) -> Result<TerminalSnapshot, RemuxError> {
+        let session = self.get_session(selector)?;
+        session.vt.as_ref().map(|vt| vt.snapshot()).ok_or_else(|| {
+            RemuxError::InvalidRequest(format!(
+                "session {} has no terminal state to capture",
+                session.name
+            ))
         })
     }
 
