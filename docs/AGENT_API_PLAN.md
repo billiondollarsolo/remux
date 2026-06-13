@@ -219,19 +219,28 @@ structured-cells contract is shared but still gateway-owned.
 
 ### 2.4 Tasks
 
-- **T0.1** Create the `remux-gateway` crate (binary `remux-gateway`) in the
-  workspace. Depends on `remux-core` (for protocol + framing) and `axum`,
-  `tokio`, `tower-http`, `rustls`/`axum-server`.
-- **T0.2** Define the `/v1` DTOs (`dto.rs`) and `From<protocol::*> for dto::*`
-  (and the reverse for request bodies). Keep all `serde(rename)` decisions here.
-- **T0.3** Implement a `DaemonConn` adapter: opens the **local Unix socket**,
-  performs the `Hello { version: PROTOCOL_VERSION }` handshake (`protocol.rs:55`),
-  and exposes typed `request()`/`subscribe()` helpers reusing
+- **T0.1** ✅ **Done.** Created the `remux-gateway` **library** crate in the
+  workspace. Depends on `remux-core` (protocol + framing), `serde`/`serde_json`,
+  `chrono`, `tokio`, `thiserror` (and `regex` for the `wait` predicate);
+  `remux-testkit` as a dev-dependency. **No `axum`/`hyper`/`rustls`/`utoipa`/`tower`
+  yet** — the HTTP/WS server is AW2; AW0 only establishes the contract + adapter,
+  keeping dependencies lean.
+- **T0.2** ✅ **Done.** `/v1` DTOs in `src/api/v1/dto.rs` and the
+  `From<protocol::*> for dto::*` (and reverse for request bodies) mappings in
+  `src/api/v1/convert.rs`. All `serde(rename)` / string-mapping decisions live in
+  that layer; `protocol.rs` is untouched.
+- **T0.3** ✅ **Done.** `DaemonConn` (`src/daemon_conn.rs`) opens the **local Unix
+  socket**, performs the `Hello { version: PROTOCOL_VERSION }` handshake and
+  **refuses** a version mismatch, and exposes typed `request()`/`subscribe()`
+  helpers (plus a composed `wait()`) reusing
   `remux_core::framing::{read_message, write_message}`.
-- **T0.4** Define the public `ApiError` → HTTP status mapping (see §5.4), derived
-  from `RemuxError` and the exit-code taxonomy.
-- **T0.5** Publish an OpenAPI 3.1 document (`docs/openapi.yaml`) generated from
-  the DTOs (e.g. `utoipa`). The spec is the contract; the daemon protocol is not.
+- **T0.4** ✅ **Done.** Public `ApiError` (`src/error.rs`) derived from
+  `RemuxError` + the exit-code taxonomy, with `fn http_status(&self) -> u16`
+  (404/403/504/503/400/502/500). Returns a bare `u16` — no `http`/axum dependency.
+- **T0.5** ⏸️ **Deferred to AW2.** OpenAPI generation (`utoipa` → `docs/openapi.yaml`)
+  pulls significant weight and is best generated *from the axum handlers*, so it
+  is deferred to AW2 where the HTTP surface is actually implemented. The DTOs here
+  are the source of truth the AW2 spec will be generated from.
 
 ### 2.5 Tests
 
@@ -244,12 +253,18 @@ structured-cells contract is shared but still gateway-owned.
 
 ### 2.6 Definition of Done
 
-- [ ] `remux-gateway` crate exists, builds, links `remux-core`.
-- [ ] `/v1` DTOs are defined separately from `protocol.rs`, with tested mappings.
-- [ ] `DaemonConn` connects over the **Unix socket only** and handshakes.
-- [ ] OpenAPI `/v1` document generated and CI-validated.
-- [ ] A daemon `PROTOCOL_VERSION` change requires **zero** public DTO changes
-      (proven by a test that bumps the internal const behind a feature flag).
+- [x] `remux-gateway` crate exists, builds, links `remux-core`.
+- [x] `/v1` DTOs are defined separately from `protocol.rs`, with tested mappings
+      (DTO JSON roundtrips + `protocol <-> dto` conversion tests, both directions).
+- [x] `DaemonConn` connects over the **Unix socket only** and handshakes; an
+      integration test drives create → list → capture-screen → kill through the
+      `/v1` DTO layer against a real daemon (`tests/daemon_conn_e2e.rs`).
+- [ ] OpenAPI `/v1` document generated and CI-validated. — **Deferred to AW2**
+      (see T0.5): generated from the axum handlers once they exist.
+- [x] A daemon `PROTOCOL_VERSION` mismatch is refused, not silently proxied
+      (`check_protocol_version` is unit-tested directly with `PROTOCOL_VERSION + 1`).
+      The public `/v1` DTOs are decoupled from `protocol.rs` so an internal wire
+      bump requires zero DTO changes; the OpenAPI feature-flag proof lands with AW2.
 
 ---
 

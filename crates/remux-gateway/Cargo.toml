@@ -1,0 +1,20 @@
+[package]
+name = "remux-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "Versioned public /v1 API contract and DaemonConn adapter for Remux (AW0)"
+
+[dependencies]
+remux-core = { path = "../remux-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["io-util", "net", "rt", "macros", "time"] }
+thiserror = "1"
+regex = "1"
+
+[dev-dependencies]
+remux-testkit = { path = "../remux-testkit" }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
