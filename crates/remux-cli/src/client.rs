@@ -34,6 +34,12 @@ impl RemuxClient {
         }
     }
 
+    /// Send a request without waiting for a response. Used for fire-and-forget
+    /// requests the daemon does not reply to (e.g. `SendInput`).
+    pub async fn send_oneway(&mut self, request: Request) -> Result<(), RemuxError> {
+        write_message(&mut self.stream, &request).await
+    }
+
     /// Split the internal stream into read and write halves (for attach mode).
     pub fn split(
         self,

@@ -464,7 +464,13 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Send input data to a session's PTY, verifying the client is the controlling client.
+    /// Send input data to a session's PTY.
+    ///
+    /// Permission rule: input is allowed when the client is the controlling
+    /// client, OR when the client is not attached at all (a pure headless
+    /// injector, e.g. `remux send`). Input is denied only when the client IS
+    /// attached but is not the controller — i.e. an observer. This preserves
+    /// the observer read-only guarantee while enabling headless injection.
     pub fn send_input_for_client(
         &mut self,
         selector: &SessionSelector,
@@ -478,7 +484,10 @@ impl SessionManager {
             .get_mut(&id)
             .ok_or_else(|| RemuxError::SessionNotFound(format!("{id:?}")))?;
 
-        if session.controlling_client.as_ref() != Some(client_id) {
+        let is_controller = session.controlling_client.as_ref() == Some(client_id);
+        let is_attached = session.attached_clients.iter().any(|c| c == client_id);
+        // Deny only attached observers (attached but not controlling).
+        if !is_controller && is_attached {
             return Err(RemuxError::PermissionDenied);
         }
 

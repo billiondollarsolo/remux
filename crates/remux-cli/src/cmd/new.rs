@@ -8,6 +8,7 @@ pub async fn run(
     client: &mut RemuxClient,
     name: Option<String>,
     command: Vec<String>,
+    json: bool,
 ) -> Result<(), RemuxError> {
     let session_name = name.unwrap_or_else(|| {
         std::env::current_dir()
@@ -38,13 +39,19 @@ pub async fn run(
 
     match response {
         Response::Created(details) => {
-            println!("Created session: {}", details.name);
-            println!("  ID:     {}", details.id.0);
-            println!("  Status: {:?}", details.status);
-            println!(
-                "  Size:   {}x{}",
-                details.last_size.cols, details.last_size.rows
-            );
+            if json {
+                let json_str = serde_json::to_string_pretty(&details)
+                    .map_err(|e| RemuxError::Internal(format!("json serialization error: {e}")))?;
+                println!("{json_str}");
+            } else {
+                println!("Created session: {}", details.name);
+                println!("  ID:     {}", details.id.0);
+                println!("  Status: {:?}", details.status);
+                println!(
+                    "  Size:   {}x{}",
+                    details.last_size.cols, details.last_size.rows
+                );
+            }
             Ok(())
         }
         Response::Error(e) => Err(e),

@@ -1,6 +1,7 @@
 mod client;
 mod cmd;
 mod daemon_spawn;
+mod exit;
 mod raw_mode;
 mod render;
 mod render_snapshot;
@@ -31,6 +32,9 @@ enum Commands {
         /// Session name (defaults to cwd basename)
         #[arg(long)]
         name: Option<String>,
+        /// Output the created session details as JSON
+        #[arg(long)]
+        json: bool,
         /// Command to run (defaults to $SHELL)
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
@@ -48,6 +52,30 @@ enum Commands {
     Attach {
         /// Session name or ID
         name: String,
+    },
+    /// Send input to a session without attaching (fire-and-forget)
+    #[command(group(
+        clap::ArgGroup::new("input")
+            .required(true)
+            .args(["text", "bytes_hex", "key", "stdin"]),
+    ))]
+    Send {
+        /// Session name or ID
+        name: String,
+        /// Send the string's bytes. Only these escapes are interpreted:
+        /// \n, \t, \r, \\. No shell or other interpretation (binary-safe).
+        #[arg(long)]
+        text: Option<String>,
+        /// Decode a hex string (e.g. "1b5b41" for ESC [ A) into raw bytes.
+        #[arg(long = "bytes-hex")]
+        bytes_hex: Option<String>,
+        /// Send a named key: Enter, Tab, Esc, Up, Down, Right, Left,
+        /// Backspace, Space.
+        #[arg(long)]
+        key: Option<String>,
+        /// Read all of stdin and send it as raw bytes.
+        #[arg(long)]
+        stdin: bool,
     },
     /// Show session details
     Inspect {
@@ -124,27 +152,53 @@ async fn main() {
     let config = load_config();
     let socket_path = get_socket_path(cli.socket.as_deref(), &config);
 
-    // Ensure the daemon is running.
+    // Ensure the daemon is running. A failure here means the daemon is
+    // unreachable (exit code 6 per the exit-code taxonomy, §5.3).
     if let Err(e) = daemon_spawn::ensure_daemon_running(&socket_path) {
         eprintln!("error: {e}");
-        process::exit(1);
+        process::exit(6);
     }
 
-    // Connect to the daemon.
+    // Connect to the daemon. A connect failure is also "daemon unreachable" (6).
     let mut client = match RemuxClient::connect(&socket_path).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
-            process::exit(1);
+            process::exit(exit::exit_code_for(&e));
         }
     };
 
     // Dispatch to command handler.
     let result = match cli.command {
-        Commands::New { name, command } => cmd::new::run(&mut client, name, command).await,
+        Commands::New {
+            name,
+            json,
+            command,
+        } => cmd::new::run(&mut client, name, command, json).await,
         Commands::Ls { json, preview } => cmd::ls::run(&mut client, json, preview).await,
         Commands::Attach { name } => {
             cmd::attach::run(client, name, &config.client.detach_key).await
+        }
+        Commands::Send {
+            name,
+            text,
+            bytes_hex,
+            key,
+            stdin,
+        } => {
+            let source = if let Some(t) = text {
+                cmd::send::InputSource::Text(t)
+            } else if let Some(h) = bytes_hex {
+                cmd::send::InputSource::BytesHex(h)
+            } else if let Some(k) = key {
+                cmd::send::InputSource::Key(k)
+            } else if stdin {
+                cmd::send::InputSource::Stdin
+            } else {
+                // clap's ArgGroup(required=true) guarantees one source is set.
+                unreachable!("clap ArgGroup guarantees an input source is present")
+            };
+            cmd::send::run(&mut client, name, source).await
         }
         Commands::Inspect { name, json } => cmd::inspect::run(&mut client, name, json).await,
         Commands::Logs { name, lines } => cmd::logs::run(&mut client, name, lines).await,
@@ -156,6 +210,6 @@ async fn main() {
 
     if let Err(e) = result {
         eprintln!("error: {e}");
-        process::exit(1);
+        process::exit(exit::exit_code_for(&e));
     }
 }
