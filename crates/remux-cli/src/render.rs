@@ -67,7 +67,10 @@ pub fn render_session_details(details: &SessionDetails) {
     println!("  Created:   {}", details.created_at);
     println!("  Updated:   {}", details.updated_at);
     println!("  Exit code: {exit_str}");
-    println!("  Size:      {}x{}", details.last_size.cols, details.last_size.rows);
+    println!(
+        "  Size:      {}x{}",
+        details.last_size.cols, details.last_size.rows
+    );
     println!("  Controller: {controller}");
     println!("  Attached:  {attached_count} client(s)");
 }

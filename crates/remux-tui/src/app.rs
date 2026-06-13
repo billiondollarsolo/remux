@@ -128,10 +128,7 @@ impl App {
     }
 
     /// Handle a keyboard event.
-    async fn handle_key_event(
-        &mut self,
-        key: KeyEvent,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle_key_event(&mut self, key: KeyEvent) -> Result<(), Box<dyn std::error::Error>> {
         match (key.modifiers, key.code) {
             // Quit (Ctrl-Q only)
             (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
@@ -192,10 +189,7 @@ impl App {
 
         let client_id = remux_core::ClientId::new();
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let size = remux_core::TermSize {
-            cols,
-            rows,
-        };
+        let size = remux_core::TermSize { cols, rows };
 
         match self
             .client

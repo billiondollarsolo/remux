@@ -3,11 +3,7 @@ use remux_core::{RemuxError, Request, Response, SessionSelector};
 use crate::client::RemuxClient;
 
 /// Handle the `logs` command.
-pub async fn run(
-    client: &mut RemuxClient,
-    name: String,
-    lines: usize,
-) -> Result<(), RemuxError> {
+pub async fn run(client: &mut RemuxClient, name: String, lines: usize) -> Result<(), RemuxError> {
     let session = parse_selector(&name);
 
     let response = client

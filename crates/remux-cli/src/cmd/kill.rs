@@ -3,14 +3,14 @@ use remux_core::{RemuxError, Request, Response, SessionSelector};
 use crate::client::RemuxClient;
 
 /// Handle the `kill` command.
-pub async fn run(
-    client: &mut RemuxClient,
-    name: String,
-) -> Result<(), RemuxError> {
+pub async fn run(client: &mut RemuxClient, name: String) -> Result<(), RemuxError> {
     let session = parse_selector(&name);
 
     let response = client
-        .send_request(Request::KillSession { session, signal: None })
+        .send_request(Request::KillSession {
+            session,
+            signal: None,
+        })
         .await?;
 
     match response {

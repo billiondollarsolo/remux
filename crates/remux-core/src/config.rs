@@ -16,9 +16,8 @@ pub struct Config {
 impl Config {
     /// Load configuration from a TOML file at the given path.
     pub fn load(path: &std::path::Path) -> Result<Self, RemuxError> {
-        let contents = std::fs::read_to_string(path).map_err(|e| {
-            RemuxError::ConfigError(format!("failed to read config file: {e}"))
-        })?;
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| RemuxError::ConfigError(format!("failed to read config file: {e}")))?;
         let config: Config = toml::from_str(&contents)
             .map_err(|e| RemuxError::ConfigError(format!("failed to parse config: {e}")))?;
         Ok(config)
@@ -40,7 +39,9 @@ pub struct DataConfig {
 }
 
 fn default_data_dir() -> std::path::PathBuf {
-    dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp")).join("remux")
+    dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("remux")
 }
 
 impl Default for DataConfig {
@@ -65,7 +66,10 @@ pub struct DaemonConfig {
 }
 
 fn default_socket_path() -> std::path::PathBuf {
-    dirs::state_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp")).join("remux").join("remuxd.sock")
+    dirs::state_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("remux")
+        .join("remuxd.sock")
 }
 
 fn default_scrollback() -> usize {
@@ -121,7 +125,10 @@ mod tests {
     fn config_default_values() {
         let config = Config::default();
         assert_eq!(config.data.dir, dirs::data_dir().unwrap().join("remux"));
-        assert_eq!(config.daemon.socket_path, dirs::state_dir().unwrap().join("remux").join("remuxd.sock"));
+        assert_eq!(
+            config.daemon.socket_path,
+            dirs::state_dir().unwrap().join("remux").join("remuxd.sock")
+        );
         assert_eq!(config.daemon.max_scrollback_lines, 20_000);
         assert!(!config.daemon.persist_scrollback);
         assert_eq!(config.daemon.cleanup_exited_after_hours, 168);

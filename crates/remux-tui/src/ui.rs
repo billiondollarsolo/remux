@@ -11,10 +11,10 @@ pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),     // title bar
-            Constraint::Min(5),        // session table
-            Constraint::Length(8),     // scrollback preview
-            Constraint::Length(1),     // footer
+            Constraint::Length(1), // title bar
+            Constraint::Min(5),    // session table
+            Constraint::Length(8), // scrollback preview
+            Constraint::Length(1), // footer
         ])
         .split(f.size());
 
@@ -165,10 +165,7 @@ fn draw_footer(f: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("=Quit "),
-        Span::styled(
-            "\u{2191}\u{2193}",
-            Style::default().fg(Color::Cyan),
-        ),
+        Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::Cyan)),
         Span::raw("=Navigate"),
     ]))
     .style(Style::default().bg(Color::DarkGray));

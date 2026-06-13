@@ -84,10 +84,7 @@ fn get_socket_path(cli_socket: Option<&str>) -> PathBuf {
     }
 
     // Try config file locations.
-    let config_dirs = [
-        dirs_config_path(),
-        PathBuf::from("/tmp/remux/config.toml"),
-    ];
+    let config_dirs = [dirs_config_path(), PathBuf::from("/tmp/remux/config.toml")];
     for config_path in &config_dirs {
         if config_path.exists() {
             if let Ok(config) = Config::load(config_path) {
@@ -116,9 +113,7 @@ fn dirs_config_path() -> PathBuf {
 async fn main() {
     // Initialize tracing (disabled by default; enable with RUST_LOG=remux_cli=debug).
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env(),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let cli = Cli::parse();

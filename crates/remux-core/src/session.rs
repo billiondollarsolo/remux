@@ -53,7 +53,12 @@ mod tests {
 
     #[test]
     fn session_status_variants() {
-        let statuses = [SessionStatus::Starting, SessionStatus::Running, SessionStatus::Exited, SessionStatus::Failed];
+        let statuses = [
+            SessionStatus::Starting,
+            SessionStatus::Running,
+            SessionStatus::Exited,
+            SessionStatus::Failed,
+        ];
         for status in statuses {
             let json = serde_json::to_string(&status).expect("serialize");
             let back: SessionStatus = serde_json::from_str(&json).expect("deserialize");
@@ -63,7 +68,10 @@ mod tests {
 
     #[test]
     fn term_size_roundtrip() {
-        let size = TermSize { cols: 120, rows: 40 };
+        let size = TermSize {
+            cols: 120,
+            rows: 40,
+        };
         let json = serde_json::to_string(&size).expect("serialize");
         let back: TermSize = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(size, back);

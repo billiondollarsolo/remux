@@ -12,16 +12,14 @@ pub fn ensure_daemon_running(socket_path: &Path) -> Result<(), RemuxError> {
 
     // Socket file might be stale if the daemon crashed. Remove it.
     if socket_path.exists() {
-        std::fs::remove_file(socket_path).map_err(|e| {
-            RemuxError::IoError(format!("failed to remove stale socket: {e}"))
-        })?;
+        std::fs::remove_file(socket_path)
+            .map_err(|e| RemuxError::IoError(format!("failed to remove stale socket: {e}")))?;
     }
 
     // Ensure the parent directory exists.
     if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            RemuxError::IoError(format!("failed to create socket directory: {e}"))
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| RemuxError::IoError(format!("failed to create socket directory: {e}")))?;
     }
 
     // Find the remuxd binary.
@@ -74,7 +72,9 @@ fn spawn_daemon(bin: &Path) -> Result<(), RemuxError> {
     // Double-fork to fully detach from the controlling terminal.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        return Err(RemuxError::IoError("failed to fork daemon process".to_string()));
+        return Err(RemuxError::IoError(
+            "failed to fork daemon process".to_string(),
+        ));
     }
     if pid > 0 {
         // Parent: wait briefly for the first fork to complete, then return.
@@ -88,15 +88,21 @@ fn spawn_daemon(bin: &Path) -> Result<(), RemuxError> {
     // First child: fork again and exit.
     let pid2 = unsafe { libc::fork() };
     if pid2 < 0 {
-        unsafe { libc::_exit(1); }
+        unsafe {
+            libc::_exit(1);
+        }
     }
     if pid2 > 0 {
-        unsafe { libc::_exit(0); }
+        unsafe {
+            libc::_exit(0);
+        }
     }
 
     // Grandchild: this is the daemon process.
     // Create a new session.
-    unsafe { libc::setsid(); }
+    unsafe {
+        libc::setsid();
+    }
 
     // Redirect stdin/stdout/stderr to /dev/null.
     let devnull_path = std::ffi::CString::new("/dev/null").unwrap_or_default();
@@ -115,7 +121,10 @@ fn spawn_daemon(bin: &Path) -> Result<(), RemuxError> {
     // Execute the daemon binary.
     let bin_cstr = std::ffi::CString::new(bin.to_string_lossy().into_owned()).unwrap_or_default();
     unsafe {
-        libc::execv(bin_cstr.as_ptr(), [bin_cstr.as_ptr(), std::ptr::null()].as_ptr());
+        libc::execv(
+            bin_cstr.as_ptr(),
+            [bin_cstr.as_ptr(), std::ptr::null()].as_ptr(),
+        );
         // If execv fails:
         libc::_exit(1);
     }

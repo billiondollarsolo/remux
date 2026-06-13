@@ -4,11 +4,7 @@ use crate::client::RemuxClient;
 use crate::render::render_session_details;
 
 /// Handle the `inspect` command.
-pub async fn run(
-    client: &mut RemuxClient,
-    name: String,
-    json: bool,
-) -> Result<(), RemuxError> {
+pub async fn run(client: &mut RemuxClient, name: String, json: bool) -> Result<(), RemuxError> {
     let session = parse_selector(&name);
 
     let response = client
@@ -18,9 +14,8 @@ pub async fn run(
     match response {
         Response::SessionDetails(details) => {
             if json {
-                let json_str = serde_json::to_string_pretty(&details).map_err(|e| {
-                    RemuxError::Internal(format!("json serialization error: {e}"))
-                })?;
+                let json_str = serde_json::to_string_pretty(&details)
+                    .map_err(|e| RemuxError::Internal(format!("json serialization error: {e}")))?;
                 println!("{json_str}");
             } else {
                 render_session_details(&details);

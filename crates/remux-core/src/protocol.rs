@@ -50,7 +50,9 @@ pub enum Request {
     Ping,
     ListSessions,
     CreateSession(CreateSessionRequest),
-    InspectSession { session: SessionSelector },
+    InspectSession {
+        session: SessionSelector,
+    },
     AttachSession {
         session: SessionSelector,
         size: TermSize,
@@ -145,7 +147,10 @@ pub enum Response {
 /// Server-pushed event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
-    Output { session: SessionId, data: Vec<u8> },
+    Output {
+        session: SessionId,
+        data: Vec<u8>,
+    },
     StateSnapshot {
         session: SessionId,
         snapshot: TerminalSnapshot,
@@ -456,8 +461,22 @@ mod tests {
             cols: 120,
             rows: 40,
             cells: vec![
-                CellData { char: 'X', fg: Some(2), bg: Some(0), bold: true, italic: false, underline: false },
-                CellData { char: 'Y', fg: None, bg: None, bold: false, italic: true, underline: true },
+                CellData {
+                    char: 'X',
+                    fg: Some(2),
+                    bg: Some(0),
+                    bold: true,
+                    italic: false,
+                    underline: false,
+                },
+                CellData {
+                    char: 'Y',
+                    fg: None,
+                    bg: None,
+                    bold: false,
+                    italic: true,
+                    underline: true,
+                },
             ],
             cursor_row: 5,
             cursor_col: 10,

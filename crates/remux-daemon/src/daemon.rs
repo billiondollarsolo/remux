@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 
 use remux_core::framing;
 use remux_core::{
-    ClientId, Config, Event, Request, Response, RemuxError, SessionId, SessionSelector,
+    ClientId, Config, Event, RemuxError, Request, Response, SessionId, SessionSelector,
 };
 
 use crate::session_manager::{SessionManager, SharedSessionManager};
@@ -34,9 +34,8 @@ impl Daemon {
 
         // Remove stale socket if it exists
         if socket_path.exists() {
-            std::fs::remove_file(&socket_path).map_err(|e| {
-                RemuxError::IoError(format!("failed to remove stale socket: {e}"))
-            })?;
+            std::fs::remove_file(&socket_path)
+                .map_err(|e| RemuxError::IoError(format!("failed to remove stale socket: {e}")))?;
         }
 
         // Bind the Unix listener
@@ -167,16 +166,10 @@ async fn handle_client(
 }
 
 /// Detach a client from all sessions it was attached to.
-async fn detach_client_from_all_sessions(
-    client_id: &ClientId,
-    sessions: &SharedSessionManager,
-) {
+async fn detach_client_from_all_sessions(client_id: &ClientId, sessions: &SharedSessionManager) {
     let sessions_list: Vec<SessionId> = {
         let mgr = sessions.lock().await;
-        mgr.list_sessions()
-            .into_iter()
-            .map(|s| s.id)
-            .collect()
+        mgr.list_sessions().into_iter().map(|s| s.id).collect()
     };
 
     for sid in sessions_list {
@@ -275,10 +268,7 @@ async fn process_request_with_events(
             }
         }
 
-        Request::RenameSession {
-            session,
-            new_name,
-        } => {
+        Request::RenameSession { session, new_name } => {
             let mut mgr = sessions.lock().await;
             match mgr.rename_session(&session, new_name) {
                 Ok(()) => (Some(Response::Ok), None),

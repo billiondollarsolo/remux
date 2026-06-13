@@ -42,7 +42,9 @@ fn main() {
     let config = load_config(&args.config);
 
     // Determine socket path
-    let socket_path = args.socket.unwrap_or_else(|| config.daemon.socket_path.clone());
+    let socket_path = args
+        .socket
+        .unwrap_or_else(|| config.daemon.socket_path.clone());
 
     info!(
         socket = %socket_path.display(),
@@ -103,7 +105,10 @@ fn load_config(config_path: &Option<PathBuf>) -> Config {
 
 /// Get the default config file path: ~/.config/remux/config.toml
 fn dirs_config_path() -> PathBuf {
-    dirs_home().join(".config").join("remux").join("config.toml")
+    dirs_home()
+        .join(".config")
+        .join("remux")
+        .join("config.toml")
 }
 
 /// Get the user's home directory.

@@ -11,9 +11,9 @@ use remux_core::{
     TermSize,
 };
 
+use crate::persistence;
 use crate::pty;
 use crate::scrollback::ScrollbackBuffer;
-use crate::persistence;
 use crate::vt::VtState;
 
 /// Handle to a live session, owned by the daemon.
@@ -193,13 +193,16 @@ impl SessionManager {
         self.sessions.insert(id.clone(), handle);
 
         // Persist session metadata
-        if let Err(e) = persistence::save_session(&self.config, &persistence::PersistedSession {
-            id: id.clone(),
-            name,
-            command: details.command.clone(),
-            cwd: details.cwd.clone(),
-            created_at: details.created_at,
-        }) {
+        if let Err(e) = persistence::save_session(
+            &self.config,
+            &persistence::PersistedSession {
+                id: id.clone(),
+                name,
+                command: details.command.clone(),
+                cwd: details.cwd.clone(),
+                created_at: details.created_at,
+            },
+        ) {
             tracing::warn!(session_id = %id.0, error = %e, "failed to persist session metadata");
         }
 
@@ -273,13 +276,16 @@ impl SessionManager {
             self.name_index.insert(new_name.clone(), id.clone());
 
             // Update persisted metadata
-            if let Err(e) = persistence::save_session(&self.config, &persistence::PersistedSession {
-                id: id.clone(),
-                name: new_name,
-                command: session.command.clone(),
-                cwd: session.cwd.clone(),
-                created_at: session.created_at,
-            }) {
+            if let Err(e) = persistence::save_session(
+                &self.config,
+                &persistence::PersistedSession {
+                    id: id.clone(),
+                    name: new_name,
+                    command: session.command.clone(),
+                    cwd: session.cwd.clone(),
+                    created_at: session.created_at,
+                },
+            ) {
                 tracing::warn!(session_id = %id.0, error = %e, "failed to persist renamed session");
             }
 
@@ -318,13 +324,13 @@ impl SessionManager {
                 let control_lost_event = Event::ControlLost {
                     session: session.id.clone(),
                 };
-                session.subscribers.retain(|tx| {
-                    match tx.try_send(control_lost_event.clone()) {
+                session
+                    .subscribers
+                    .retain(|tx| match tx.try_send(control_lost_event.clone()) {
                         Ok(()) => true,
                         Err(mpsc::error::TrySendError::Full(_)) => true,
                         Err(mpsc::error::TrySendError::Closed(_)) => false,
-                    }
-                });
+                    });
                 tracing::info!(
                     session_id = %session.id.0,
                     old_client = ?old_client_id,

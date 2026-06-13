@@ -15,14 +15,12 @@ pub struct PersistedSession {
 /// Save session metadata as JSON to the data directory.
 pub fn save_session(config: &Config, session: &PersistedSession) -> Result<(), RemuxError> {
     let sessions_dir = config.data.dir.join("sessions");
-    std::fs::create_dir_all(&sessions_dir).map_err(|e| {
-        RemuxError::IoError(format!("failed to create sessions dir: {e}"))
-    })?;
+    std::fs::create_dir_all(&sessions_dir)
+        .map_err(|e| RemuxError::IoError(format!("failed to create sessions dir: {e}")))?;
 
     let path = sessions_dir.join(format!("{}.json", session.id.0));
-    let json = serde_json::to_string_pretty(session).map_err(|e| {
-        RemuxError::IoError(format!("failed to serialize session: {e}"))
-    })?;
+    let json = serde_json::to_string_pretty(session)
+        .map_err(|e| RemuxError::IoError(format!("failed to serialize session: {e}")))?;
 
     std::fs::write(&path, json)
         .map_err(|e| RemuxError::IoError(format!("failed to write session file: {e}")))?;
@@ -74,7 +72,11 @@ pub fn load_sessions(config: &Config) -> Vec<PersistedSession> {
 /// Remove a session's persisted metadata file.
 #[allow(dead_code)]
 pub fn remove_session(config: &Config, id: &SessionId) -> Result<(), RemuxError> {
-    let path = config.data.dir.join("sessions").join(format!("{}.json", id.0));
+    let path = config
+        .data
+        .dir
+        .join("sessions")
+        .join(format!("{}.json", id.0));
     if path.exists() {
         std::fs::remove_file(&path)
             .map_err(|e| RemuxError::IoError(format!("failed to remove session file: {e}")))?;

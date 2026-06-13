@@ -4,11 +4,7 @@ use crate::client::RemuxClient;
 use crate::render::render_session_list;
 
 /// Handle the `ls` command.
-pub async fn run(
-    client: &mut RemuxClient,
-    json: bool,
-    preview: bool,
-) -> Result<(), RemuxError> {
+pub async fn run(client: &mut RemuxClient, json: bool, preview: bool) -> Result<(), RemuxError> {
     let response = client.send_request(Request::ListSessions).await?;
 
     match response {

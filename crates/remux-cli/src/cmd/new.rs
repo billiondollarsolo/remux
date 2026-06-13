@@ -12,10 +12,7 @@ pub async fn run(
     let session_name = name.unwrap_or_else(|| {
         std::env::current_dir()
             .ok()
-            .and_then(|p| {
-                p.file_name()
-                    .map(|f| f.to_string_lossy().into_owned())
-            })
+            .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "session".to_string())
     });
 

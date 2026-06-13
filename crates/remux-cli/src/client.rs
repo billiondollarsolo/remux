@@ -13,9 +13,9 @@ pub struct RemuxClient {
 impl RemuxClient {
     /// Connect to the daemon's Unix domain socket.
     pub async fn connect(socket_path: &Path) -> Result<Self, RemuxError> {
-        let stream = UnixStream::connect(socket_path)
-            .await
-            .map_err(|e| RemuxError::ConnectionFailed(format!("failed to connect to daemon: {e}")))?;
+        let stream = UnixStream::connect(socket_path).await.map_err(|e| {
+            RemuxError::ConnectionFailed(format!("failed to connect to daemon: {e}"))
+        })?;
         Ok(Self {
             stream,
             line_buf: Vec::new(),

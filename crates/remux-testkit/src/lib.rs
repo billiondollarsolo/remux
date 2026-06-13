@@ -36,9 +36,9 @@ impl DaemonHarness {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let child = cmd.spawn().map_err(|e| {
-            RemuxError::Internal(format!("failed to spawn remuxd: {e}"))
-        })?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| RemuxError::Internal(format!("failed to spawn remuxd: {e}")))?;
 
         let mut harness = Self {
             daemon_process: Some(child),
@@ -65,9 +65,9 @@ impl DaemonHarness {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let child = cmd.spawn().map_err(|e| {
-            RemuxError::Internal(format!("failed to spawn remuxd: {e}"))
-        })?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| RemuxError::Internal(format!("failed to spawn remuxd: {e}")))?;
 
         let mut harness = Self {
             daemon_process: Some(child),
@@ -100,7 +100,10 @@ impl DaemonHarness {
     }
 
     /// Wait for the Unix socket file to exist.
-    async fn wait_for_socket(&mut self, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
+    async fn wait_for_socket(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let start = std::time::Instant::now();
         while start.elapsed() < timeout {
             if self.socket_path.exists() {
@@ -110,7 +113,9 @@ impl DaemonHarness {
             if let Some(ref mut child) = self.daemon_process {
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        return Err(format!("remuxd exited prematurely with status: {status}").into());
+                        return Err(
+                            format!("remuxd exited prematurely with status: {status}").into()
+                        );
                     }
                     Ok(None) => {} // Still running
                     Err(e) => {
@@ -128,7 +133,9 @@ impl DaemonHarness {
         let candidates = [
             PathBuf::from("target/debug/remuxd"),
             PathBuf::from("target/release/remuxd"),
-            cargo_home().map(|h| h.join("bin/remuxd")).unwrap_or_default(),
+            cargo_home()
+                .map(|h| h.join("bin/remuxd"))
+                .unwrap_or_default(),
             PathBuf::from("/usr/local/bin/remuxd"),
         ];
 

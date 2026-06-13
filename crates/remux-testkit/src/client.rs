@@ -95,10 +95,7 @@ impl TestClient {
     }
 
     /// Get full details for a session by name.
-    pub async fn inspect_session(
-        &mut self,
-        name: &str,
-    ) -> Result<SessionDetails, RemuxError> {
+    pub async fn inspect_session(&mut self, name: &str) -> Result<SessionDetails, RemuxError> {
         let request = Request::InspectSession {
             session: remux_core::SessionSelector::Name(name.to_string()),
         };

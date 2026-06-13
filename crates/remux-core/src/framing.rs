@@ -30,8 +30,9 @@ pub async fn read_message<T: serde::de::DeserializeOwned>(
                                 continue;
                             }
                             let line = String::from_utf8_lossy(line_buf);
-                            let msg: T = serde_json::from_str(line.trim())
-                                .map_err(|e| RemuxError::ProtocolError(format!("json parse: {e}")))?;
+                            let msg: T = serde_json::from_str(line.trim()).map_err(|e| {
+                                RemuxError::ProtocolError(format!("json parse: {e}"))
+                            })?;
                             line_buf.clear();
                             return Ok(Some(msg));
                         }
@@ -56,7 +57,9 @@ pub async fn read_message<T: serde::de::DeserializeOwned>(
         }
         let len = u32::from_le_bytes(len_buf) as usize;
         if len > 16 * 1024 * 1024 {
-            return Err(RemuxError::ProtocolError(format!("message too large: {len} bytes")));
+            return Err(RemuxError::ProtocolError(format!(
+                "message too large: {len} bytes"
+            )));
         }
         let mut data = vec![0u8; len];
         reader
@@ -161,8 +164,9 @@ pub fn read_message_blocking<T: serde::de::DeserializeOwned>(
                                 continue;
                             }
                             let line = String::from_utf8_lossy(line_buf);
-                            let msg: T = serde_json::from_str(line.trim())
-                                .map_err(|e| RemuxError::ProtocolError(format!("json parse: {e}")))?;
+                            let msg: T = serde_json::from_str(line.trim()).map_err(|e| {
+                                RemuxError::ProtocolError(format!("json parse: {e}"))
+                            })?;
                             line_buf.clear();
                             return Ok(Some(msg));
                         }
@@ -187,7 +191,9 @@ pub fn read_message_blocking<T: serde::de::DeserializeOwned>(
         }
         let len = u32::from_le_bytes(len_buf) as usize;
         if len > 16 * 1024 * 1024 {
-            return Err(RemuxError::ProtocolError(format!("message too large: {len} bytes")));
+            return Err(RemuxError::ProtocolError(format!(
+                "message too large: {len} bytes"
+            )));
         }
         let mut data = vec![0u8; len];
         reader

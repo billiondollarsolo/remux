@@ -46,12 +46,14 @@ pub fn spawn_pty(
         }
     };
 
-    let master = pair.master.try_clone_reader().map_err(|e| {
-        RemuxError::PtyError(format!("failed to clone pty reader: {e}"))
-    })?;
-    let writer = pair.master.take_writer().map_err(|e| {
-        RemuxError::PtyError(format!("failed to get pty writer: {e}"))
-    })?;
+    let master = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| RemuxError::PtyError(format!("failed to clone pty reader: {e}")))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| RemuxError::PtyError(format!("failed to get pty writer: {e}")))?;
 
     Ok(PtyProcess {
         pid,
@@ -64,11 +66,7 @@ pub fn spawn_pty(
 
 /// Build a CommandBuilder from the given command args, cwd, and env.
 /// If command is empty, falls back to $SHELL (or /bin/sh).
-fn build_command(
-    command: &[String],
-    cwd: &PathBuf,
-    env: &[(String, String)],
-) -> CommandBuilder {
+fn build_command(command: &[String], cwd: &PathBuf, env: &[(String, String)]) -> CommandBuilder {
     let (cmd_name, args) = if command.is_empty() {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         (shell, vec![])

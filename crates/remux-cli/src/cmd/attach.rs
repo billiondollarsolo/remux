@@ -12,10 +12,7 @@ use crate::client::RemuxClient;
 use crate::raw_mode::get_terminal_size;
 
 /// Handle the `attach` command.
-pub async fn run(
-    mut client: RemuxClient,
-    name: String,
-) -> Result<(), RemuxError> {
+pub async fn run(mut client: RemuxClient, name: String) -> Result<(), RemuxError> {
     let session = parse_selector(&name);
     let size: TermSize = get_terminal_size();
     let client_id = ClientId::new();
@@ -43,8 +40,7 @@ pub async fn run(
     let session_name = bootstrap.session.name.clone();
 
     // Enter raw terminal mode.
-    enable_raw_mode()
-        .map_err(|e| RemuxError::IoError(format!("failed to enter raw mode: {e}")))?;
+    enable_raw_mode().map_err(|e| RemuxError::IoError(format!("failed to enter raw mode: {e}")))?;
 
     // Guard to ensure we always exit raw mode.
     struct RawModeGuard;
@@ -74,8 +70,7 @@ pub async fn run(
 
     // Spawn stdin reader task.
     let input_handle = task::spawn_blocking(move || -> Result<CrosstermEvent, RemuxError> {
-        crossterm::event::read()
-            .map_err(|e| RemuxError::IoError(format!("stdin read error: {e}")))
+        crossterm::event::read().map_err(|e| RemuxError::IoError(format!("stdin read error: {e}")))
     });
 
     let mut input_task = input_handle;
