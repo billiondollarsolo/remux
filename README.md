@@ -290,17 +290,55 @@ daemon over the local Unix socket; **`remuxd` never listens on a network port**.
 remux-gateway                                    # TLS on 127.0.0.1:8443; self-signed cert + random token (logged)
 remux-gateway --listen 0.0.0.0:8443 \
   --token "$RW_TOKEN" --read-token "$RO_TOKEN" \
+  --auth-config auth.toml \
   --tls-cert cert.pem --tls-key key.pem
 ```
 
 - **TLS always on.** Supply `--tls-cert`/`--tls-key`, or a self-signed cert is
   generated for `127.0.0.1`/`localhost` (fingerprint logged).
-- **Bearer auth, deny-by-default.** `--token`/`REMUX_GATEWAY_TOKEN` is read-write;
-  optional `--read-token`/`REMUX_GATEWAY_READ_TOKEN` is read-only. Read-only
-  tokens may call the `GET` endpoints, `POST /wait`, and the `/events` stream;
-  mutating routes and the `/stream` socket require the read-write token (`403`
-  otherwise; `401` for an unknown token). Every request is audit-logged
-  (method, path, status, scope, hashed token id, peer, latency — never the raw token).
+- **Principal + RBAC bearer auth, deny-by-default.** A presented bearer token
+  resolves (constant-time) to a **principal** (`{subject, roles}`); each route
+  requires a fine-grained **permission**, and the principal's roles are evaluated
+  against a **policy** (the shared `remux-authz` model). An unknown/missing token
+  is `401`; a known principal lacking the route's permission is `403`. Every
+  request is audit-logged (method, path, status, principal subject + roles,
+  hashed token id, peer, latency — never the raw token).
+- **Back-compat token flags.** `--token`/`REMUX_GATEWAY_TOKEN` maps to the
+  built-in **`admin`** role (all gateway permissions); optional
+  `--read-token`/`REMUX_GATEWAY_READ_TOKEN` maps to the built-in **`viewer`**
+  role (read-only). So the old read-write / read-only behaviour is preserved:
+  a `viewer` token may call the `GET` endpoints, `POST /wait`, and the `/events`
+  stream, but mutating routes and the `/stream` socket require a writing role
+  (`403` otherwise).
+
+#### Gateway roles & permissions
+
+| Built-in role | Permissions |
+|---|---|
+| `viewer`   | `session.list`, `session.read`, `session.wait`, `events.read` |
+| `operator` | `viewer` + `session.create`, `session.input`, `session.resize`, `session.kill`, `session.rename`, `session.stream` |
+| `admin`    | every gateway permission |
+
+#### `--auth-config` (principal-shaped tokens + custom roles)
+
+`--auth-config <FILE>` (env `REMUX_GATEWAY_AUTH_CONFIG`) loads a TOML file that
+adds principal-shaped tokens and optional custom roles. Custom roles are merged
+**over** the built-ins; its tokens are layered on top of the back-compat flags
+(a flag token wins a duplicate-secret collision):
+
+```toml
+[[tokens]]
+token = "ci-secret"            # the bearer secret
+subject = "ci-bot"             # audit identity
+roles = ["operator"]           # built-in or custom role names
+
+[[roles]]                      # optional custom roles
+name = "deployer"
+permissions = ["session.create", "session.input", "session.read"]
+```
+
+A `deployer` token above can create + input + read, but **not** kill (it lacks
+`session.kill`).
 
 ### Auto-join a control plane (`--register`)
 
@@ -355,9 +393,11 @@ POST   /v1/sessions/{id}/wait          # {kind: idle|regex|exit} ?timeout_ms=
 
 - `wss://…/v1/sessions/{id}/stream` — an attachable terminal: **binary** frames
   carry raw I/O byte-exact (output → client, input → daemon); a **text** frame
-  `{"type":"resize","cols":N,"rows":N}` resizes. Requires read-write scope.
+  `{"type":"resize","cols":N,"rows":N}` resizes. Requires the `session.stream`
+  permission (the `operator`/`admin` roles).
 - `wss://…/v1/sessions/{id}/events` — **structured JSON** lifecycle events
-  (exited/updated/…). Read scope is enough.
+  (exited/updated/…). The `events.read` permission (any role incl. `viewer`) is
+  enough.
 
 WS clients pass the token via `?token=…` (browser-friendly) or the
 `Authorization` header. The published contract is decoupled from the internal
@@ -388,29 +428,51 @@ control-plane core (`spec.md` §10, `docs/AGENT_API_PLAN.md` §8).
 remux-control-plane                              # TLS on 127.0.0.1:9443; self-signed cert + admin/register tokens (logged)
 remux-control-plane --listen 0.0.0.0:9443 \
   --token "$ADMIN_TOKEN" --register-token "$REGISTER_TOKEN" \
+  --auth-config auth.toml \
   --tls-cert cert.pem --tls-key key.pem
 ```
 
 **Security model.** The daemon stays **local-only** (Unix socket, no network
 listener). Gateways **register outbound** to the control plane — the control
 plane never dials a host it was not first told about, so no inbound listener is
-added anywhere new. Two bearer tokens, deny-by-default, constant-time compare:
-the **admin** token guards the fleet API; the lower-privilege **register** token
-is what each gateway carries to join. Every request is audit-logged (method,
-path, status, token kind, peer, latency — never raw tokens). v1 **trusts
-self-signed gateway certs** (`--gateway-tls-insecure`, default `true`, logged as
-a warning); gateway-cert pinning / CA trust is a hardening follow-up.
+added anywhere new. The control plane uses the **same principal + RBAC model**
+as the gateway (the shared `remux-authz` crate), deny-by-default, constant-time
+token resolution. An unknown/missing token is `401`; a known principal lacking
+the route's permission is `403`. Every request is audit-logged (method, path,
+status, principal subject + roles, hashed token id, peer, latency — never raw
+tokens). v1 **trusts self-signed gateway certs** (`--gateway-tls-insecure`,
+default `true`, logged as a warning); gateway-cert pinning / CA trust is the
+remaining Phase C follow-up.
+
+**Back-compat token flags.** `--token`/`REMUX_CP_TOKEN` maps to the built-in
+**`fleet-admin`** role (every control-plane permission, a superuser that may also
+register); `--register-token`/`REMUX_CP_REGISTER_TOKEN` maps to the
+lower-privilege **`registrar`** role (register / heartbeat / deregister only).
+
+#### Control-plane roles & permissions
+
+| Built-in role    | Permissions |
+|---|---|
+| `registrar`      | `host.register` (register / heartbeat / deregister) |
+| `fleet-viewer`   | `fleet.hosts.read`, `fleet.sessions.read` |
+| `fleet-operator` | `fleet-viewer` + `fleet.resolve` |
+| `fleet-admin`    | every control-plane permission |
+
+`--auth-config <FILE>` (env `REMUX_CP_AUTH_CONFIG`) adds principal-shaped tokens
+and custom roles using the **same TOML format** as the gateway (above). For
+example, a token bound to `fleet-viewer` can list hosts and read federated
+sessions but is `403` on `POST /cp/v1/resolve`.
 
 ### Endpoints
 
 ```
 GET    /cp/v1/health                   # liveness (no auth)
-POST   /cp/v1/register                 # gateway joins: {name,url,labels,token,ttl_secs?}  (register token)
-POST   /cp/v1/heartbeat                # refresh last_seen: {name}                          (register token)
-DELETE /cp/v1/hosts/{name}             # deregister                                         (register token)
-GET    /cp/v1/hosts                    # list {name,url,labels,last_seen,healthy}           (admin token)
-GET    /cp/v1/sessions[?label=k=v]…    # concurrent fan-out of /v1/sessions, tagged by host (admin token)
-POST   /cp/v1/resolve                  # intent routing: {labels,command?,reuse_name?}      (admin token)
+POST   /cp/v1/register                 # gateway joins: {name,url,labels,token,ttl_secs?}  (host.register)
+POST   /cp/v1/heartbeat                # refresh last_seen: {name}                          (host.register)
+DELETE /cp/v1/hosts/{name}             # deregister                                         (host.register)
+GET    /cp/v1/hosts                    # list {name,url,labels,last_seen,healthy}           (fleet.hosts.read)
+GET    /cp/v1/sessions[?label=k=v]…    # concurrent fan-out of /v1/sessions, tagged by host (fleet.sessions.read)
+POST   /cp/v1/resolve                  # intent routing: {labels,command?,reuse_name?}      (fleet.resolve)
 ```
 
 - **Registry** — an in-memory map keyed by host name; registration is an

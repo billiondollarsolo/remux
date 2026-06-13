@@ -14,8 +14,9 @@
 //! - [`app`] — the `/cp/v1` axum router: the registry endpoints (register/
 //!   heartbeat/deregister/list), the federated fleet API (concurrent fan-out of
 //!   `GET /v1/sessions`), and intent-based session [`resolve`]ing.
-//! - [`auth`] — two-token bearer auth (admin vs register), constant-time compare,
-//!   deny-by-default, with per-request audit logging.
+//! - [`auth`] — bearer auth with a constant-time token→[`Principal`] resolve and
+//!   per-route [`Permission`] checks against an RBAC [`Policy`] (the shared
+//!   [`remux_authz`] model), deny-by-default, with per-request audit logging.
 //! - [`tls`] — rustls material (operator PEM or self-signed for loopback).
 //! - [`server`] — serving over TLS via `axum-server`.
 //!
@@ -31,8 +32,9 @@ pub mod server;
 pub mod tls;
 
 pub use app::{router, AppState};
-pub use auth::{AuthConfig, TokenKind};
+pub use auth::AuthConfig;
 pub use client::GatewayClient;
 pub use registry::{HostEntry, HostView, Registry};
+pub use remux_authz::{Permission, Principal};
 pub use server::{bind_listener, serve};
 pub use tls::TlsMaterial;

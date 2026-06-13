@@ -38,6 +38,13 @@ struct Cli {
     #[arg(long, env = "REMUX_CP_REGISTER_TOKEN")]
     register_token: Option<String>,
 
+    /// Optional path to a TOML auth-config file adding principal-shaped tokens
+    /// and custom roles (RBAC). Merged over the back-compat `--token` /
+    /// `--register-token` flags and the built-in roles. Falls back to
+    /// `REMUX_CP_AUTH_CONFIG`.
+    #[arg(long, value_name = "FILE", env = "REMUX_CP_AUTH_CONFIG")]
+    auth_config: Option<PathBuf>,
+
     /// TLS certificate (PEM). Must be paired with `--tls-key`. If both are
     /// omitted, a self-signed cert is generated for `127.0.0.1`/`localhost`.
     #[arg(long)]
@@ -96,7 +103,12 @@ async fn run(cli: Cli) -> Result<(), String> {
         Some(t) if !t.is_empty() => (t, false),
         _ => (generate_token(), true),
     };
-    let auth = AuthConfig::new(admin_token.clone(), register_token.clone());
+    let auth = AuthConfig::from_flags_and_config(
+        admin_token.clone(),
+        register_token.clone(),
+        cli.auth_config.as_deref(),
+    )
+    .map_err(|e| format!("auth config: {e}"))?;
 
     // Resolve TLS material (operator PEM or self-signed for loopback).
     let tls = TlsMaterial::resolve(cli.tls_cert, cli.tls_key)?;
@@ -145,10 +157,14 @@ async fn run(cli: Cli) -> Result<(), String> {
         println!();
     }
     tracing::info!(
-        admin_token_id = %auth.admin_audit_id(),
-        register_token_id = %auth.register_audit_id(),
-        "bearer auth active (deny-by-default; admin + register tokens)"
+        admin_token_id = %remux_control_plane::auth::audit_id_for(&admin_token),
+        register_token_id = %remux_control_plane::auth::audit_id_for(&register_token),
+        token_count = auth.token_count(),
+        "bearer auth active (deny-by-default; RBAC principals: admin -> `fleet-admin`, register -> `registrar`)"
     );
+    if cli.auth_config.is_some() {
+        tracing::info!("auth-config file loaded (principal-shaped tokens + custom roles)");
+    }
 
     let state = AppState::new(auth).with_gateway_tls_insecure(cli.gateway_tls_insecure);
 

@@ -21,7 +21,7 @@ use serde_json::json;
 
 use remux_core::TermSize;
 
-use crate::auth::{audit_id_for, bearer_from_header, AuthConfig, Scope};
+use crate::auth::{audit_id_for, bearer_from_header, AuthConfig, Permission, Principal};
 use crate::convert::wait_result;
 use crate::daemon_conn::WaitPredicate;
 use crate::dto::{
@@ -107,49 +107,70 @@ fn err_kind(err: &ApiError) -> &'static str {
 /// the audit middleware can log it without re-resolving the token.
 #[derive(Clone)]
 struct AuthContext {
-    scope: Scope,
+    subject: String,
+    roles: String,
     token_id: String,
 }
 
 /// Build the full router with auth + the `/v1` surface.
 ///
-/// The authed surface is split by **required scope** (plan §6.2):
-/// - read routes (list/inspect/screen/scrollback/wait, `/events` WS) require
-///   `Scope::ReadOnly` — a read-write token satisfies them too.
-/// - write routes (create/delete/rename/input/resize, `/stream` WS) require
-///   `Scope::ReadWrite`.
+/// The authed surface uses **per-route permission** enforcement (the shared
+/// [`remux_authz`] RBAC model; plan §6.2): each route group declares the
+/// [`Permission`] it requires, and a middleware resolves the bearer to a
+/// [`Principal`] (else `401`) and rejects a principal lacking the permission with
+/// `403`. A per-request audit middleware wraps the whole `/v1` surface.
 ///
-/// Each group runs a scope-enforcing middleware that resolves the bearer to a
-/// scope (else `401`) and rejects an under-scoped token with `403`. A per-request
-/// audit middleware wraps the whole `/v1` surface.
+/// Routes are grouped by required permission. Single-permission groups keep the
+/// router declarative while preserving the exact endpoint set.
 pub fn router(state: AppState) -> Router {
-    // Read-scope routes: safe/observe-only.
-    let read_routes = Router::new()
+    // A one-route-group guard: enforce `perm` before the inner routes run. The
+    // closure captures the required permission and resolves the principal via the
+    // shared state, so each route declares exactly the permission it needs.
+    let guard = |perm: Permission| {
+        let state = state.clone();
+        middleware::from_fn_with_state(
+            state,
+            move |State(st): State<AppState>, req: Request, next: Next| {
+                enforce_permission(st, perm, req, next)
+            },
+        )
+    };
+
+    // GET-style read routes (each declares its precise permission).
+    let list = Router::new()
         .route("/sessions", get(list_sessions))
+        .layer(guard(Permission::SessionList));
+    let read = Router::new()
         .route("/sessions/:id", get(get_session))
         .route("/sessions/:id/screen", get(get_screen))
         .route("/sessions/:id/scrollback", get(get_scrollback))
+        .layer(guard(Permission::SessionRead));
+    let wait = Router::new()
         .route("/sessions/:id/wait", post(wait_session))
+        .layer(guard(Permission::SessionWait));
+    let events = Router::new()
         .route("/sessions/:id/events", get(crate::ws::events_ws))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_read_scope,
-        ));
+        .layer(guard(Permission::EventsRead));
 
-    // Write-scope routes: mutate or inject.
-    let write_routes = Router::new()
+    // Mutating / injecting routes.
+    let create = Router::new()
         .route("/sessions", post(create_session))
-        .route(
-            "/sessions/:id",
-            axum::routing::delete(delete_session).patch(patch_session),
-        )
+        .layer(guard(Permission::SessionCreate));
+    let kill = Router::new()
+        .route("/sessions/:id", axum::routing::delete(delete_session))
+        .layer(guard(Permission::SessionKill));
+    let rename = Router::new()
+        .route("/sessions/:id", axum::routing::patch(patch_session))
+        .layer(guard(Permission::SessionRename));
+    let input = Router::new()
         .route("/sessions/:id/input", post(send_input))
+        .layer(guard(Permission::SessionInput));
+    let resize = Router::new()
         .route("/sessions/:id/resize", post(resize_session))
+        .layer(guard(Permission::SessionResize));
+    let stream = Router::new()
         .route("/sessions/:id/stream", get(crate::ws::stream_ws))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_write_scope,
-        ));
+        .layer(guard(Permission::SessionStream));
 
     // Public (no auth): health + the OpenAPI document (discoverability).
     let public = Router::new()
@@ -164,69 +185,67 @@ pub fn router(state: AppState) -> Router {
         .route("/app.js", get(crate::web::app_js))
         .route("/style.css", get(crate::web::style_css));
 
+    let v1 = public
+        .merge(list)
+        .merge(read)
+        .merge(wait)
+        .merge(events)
+        .merge(create)
+        .merge(kill)
+        .merge(rename)
+        .merge(input)
+        .merge(resize)
+        .merge(stream);
+
     Router::new()
-        .nest("/v1", public.merge(read_routes).merge(write_routes))
+        .nest("/v1", v1)
         // Audit every /v1 request (after routing, so the matched path is known).
         .layer(middleware::from_fn(audit_layer))
         .merge(web_routes)
         .with_state(state)
 }
 
-/// Scope-enforcing middleware for the **read** routes.
-async fn require_read_scope(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    enforce_scope(state, Scope::ReadOnly, request, next).await
-}
-
-/// Scope-enforcing middleware for the **write** routes.
-async fn require_write_scope(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    enforce_scope(state, Scope::ReadWrite, request, next).await
-}
-
-/// Resolve the presented bearer to a scope and enforce `required`.
+/// Resolve the presented bearer to a [`Principal`] and enforce `required`.
 ///
 /// Deny-by-default:
 /// - no/unknown token → `401` (`unauthorized`).
-/// - a recognized token whose scope does not satisfy `required` → `403`
-///   (`forbidden`), a distinct outcome from the `401`.
+/// - a recognized principal lacking `required` → `403` (`forbidden`), a distinct
+///   outcome from the `401`.
 ///
-/// On success the resolved [`AuthContext`] is inserted into request extensions
-/// so the audit layer can log the scope + token id.
-async fn enforce_scope(
+/// On success the resolved [`AuthContext`] (subject + roles + token id) is
+/// inserted into request extensions so the audit layer can log it.
+async fn enforce_permission(
     state: AppState,
-    required: Scope,
+    required: Permission,
     mut request: Request,
     next: Next,
 ) -> Response {
     let presented = extract_token(request.headers(), request.uri().query());
-    let scope = presented
-        .as_deref()
-        .and_then(|t| state.auth.resolve_scope(t));
-    let scope = match scope {
-        Some(s) => s,
+    let principal: Principal = match presented.as_deref().and_then(|t| state.auth.resolve(t)) {
+        Some(p) => p.clone(),
         None => {
             let body =
                 json!({ "error": "missing or invalid bearer token", "kind": "unauthorized" });
             return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
         }
     };
-    if !scope.satisfies(required) {
+    if !state.auth.permits(&principal, required) {
         let body = json!({
-            "error": "this token is read-only; a read-write token is required for this endpoint",
+            "error": format!(
+                "principal {:?} lacks the {} permission required for this endpoint",
+                principal.subject, required
+            ),
             "kind": "forbidden",
         });
         return (StatusCode::FORBIDDEN, Json(body)).into_response();
     }
     // Stash identity for the audit layer (token never logged in the clear).
     let token_id = presented.as_deref().map(audit_id_for).unwrap_or_default();
-    let ctx = AuthContext { scope, token_id };
+    let ctx = AuthContext {
+        subject: principal.subject.clone(),
+        roles: principal.roles_display(),
+        token_id,
+    };
     request.extensions_mut().insert(ctx.clone());
     let mut response = next.run(request).await;
     // Propagate the identity onto the response so the (outer) audit layer can
@@ -240,9 +259,10 @@ async fn enforce_scope(
 ///
 /// Emits one structured `tracing` line per `/v1` request with: method, the
 /// matched route path (with `{id}` placeholders, not the concrete id), HTTP
-/// status, the resolved scope + non-reversible `token_id` (or `anonymous` for
-/// the public routes / rejected requests), the client remote address, and the
-/// latency in ms. **No secret material is logged** — only the hashed token id.
+/// status, the resolved principal's subject + roles + non-reversible `token_id`
+/// (or `anonymous` for the public routes / rejected requests), the client remote
+/// address, and the latency in ms. **No secret material is logged** — only the
+/// hashed token id.
 async fn audit_layer(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     // Prefer the matched route template (`/v1/sessions/:id`) over the concrete
@@ -262,11 +282,15 @@ async fn audit_layer(request: Request, next: Next) -> Response {
     let response = next.run(request).await;
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    // The auth context (if any) was inserted by the scope middleware; for public
-    // or rejected requests it is absent → anonymous.
-    let (scope, token_id) = match response.extensions().get::<AuthContext>() {
-        Some(ctx) => (scope_str(ctx.scope), ctx.token_id.clone()),
-        None => ("anonymous", "anonymous".to_string()),
+    // The auth context (if any) was inserted by the permission middleware; for
+    // public or rejected requests it is absent → anonymous.
+    let (subject, roles, token_id) = match response.extensions().get::<AuthContext>() {
+        Some(ctx) => (ctx.subject.clone(), ctx.roles.clone(), ctx.token_id.clone()),
+        None => (
+            "anonymous".to_string(),
+            String::new(),
+            "anonymous".to_string(),
+        ),
     };
 
     tracing::info!(
@@ -274,7 +298,8 @@ async fn audit_layer(request: Request, next: Next) -> Response {
         method = %method,
         path = %path,
         status = response.status().as_u16(),
-        scope = scope,
+        subject = %subject,
+        roles = %roles,
         token_id = %token_id,
         remote = %remote,
         latency_ms = format!("{latency_ms:.2}"),
@@ -282,14 +307,6 @@ async fn audit_layer(request: Request, next: Next) -> Response {
     );
 
     response
-}
-
-/// The public string form of a scope for audit lines.
-fn scope_str(scope: Scope) -> &'static str {
-    match scope {
-        Scope::ReadOnly => "read",
-        Scope::ReadWrite => "read_write",
-    }
 }
 
 /// Pull a bearer token from the `Authorization` header or the `token` query param.

@@ -1,4 +1,5 @@
-//! Bearer-token authentication and authorization for the gateway (AW4 v1).
+//! Bearer-token authentication and **principal + RBAC** authorization for the
+//! gateway (AW4, Phase A).
 //!
 //! Deny-by-default: every `/v1/*` route except `GET /v1/health` and
 //! `GET /v1/openapi.json` requires a valid bearer token. For REST and WebSocket
@@ -6,168 +7,110 @@
 //! WebSocket routes ADDITIONALLY accept `?token=<token>` (browsers cannot set
 //! `Authorization` on a WS handshake).
 //!
-//! v1 supports a **coarse scope split** (the plan §6.2): a token resolves to a
-//! [`Scope`] of either [`Scope::ReadWrite`] (the full-access token) or
-//! [`Scope::ReadOnly`] (an observe-only token). Read scope may call the safe
-//! endpoints (list/inspect/screen/scrollback/wait/`/events`); write scope is
-//! required for anything that mutates or injects (create/delete/rename/input/
-//! resize/`/stream`). A read-only token hitting a write route is `403`
-//! (distinct from the `401` for an unrecognized token).
+//! The model now lives in [`remux_authz`]: a presented token resolves (in
+//! **constant time**) to a [`Principal`], whose roles are evaluated against a
+//! [`Policy`]. Each route declares a required [`Permission`]; an unknown/missing
+//! token is `401`, a known token whose principal lacks the permission is `403`.
 //!
-//! Each token comparison is **constant-time** to avoid leaking the secret
-//! through timing. Tokens are never logged in the clear; the audit line logs a
-//! short non-reversible hash (`token_audit_id`).
+//! Back-compat: `--token` maps to principal `{subject:"admin", roles:["admin"]}`
+//! and `--read-token` to `{subject:"reader", roles:["viewer"]}`, preserving the
+//! old read-write / read-only two-token behaviour on top of the new model. An
+//! optional `--auth-config` file adds further principal-shaped tokens and custom
+//! roles.
+//!
+//! Tokens are never logged in the clear; the audit line logs the subject, roles,
+//! and a short non-reversible token id.
 
+use std::path::Path;
 use std::sync::Arc;
 
-/// The coarse authorization scope a token grants (plan §6.2).
-///
-/// `ReadOnly` ⊂ `ReadWrite`: anything a read token may do, a read-write token
-/// may also do. Enforcement is per-route via [`Scope::satisfies`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scope {
-    /// Observe-only: list/inspect/screen/scrollback/wait and the `/events` WS.
-    ReadOnly,
-    /// Full access: everything `ReadOnly` allows, plus all mutating/injecting
-    /// endpoints (create/delete/rename/input/resize and the `/stream` WS).
-    ReadWrite,
-}
+pub use remux_authz::{
+    audit_id_for, bearer_from_header, load_auth_config, permits, AuthConfigError, Permission,
+    Policy, Principal, TokenStore,
+};
 
-impl Scope {
-    /// Whether a token of `self` scope is allowed to call a route that
-    /// `required` scope. `ReadWrite` satisfies any requirement; `ReadOnly`
-    /// satisfies only a `ReadOnly` requirement.
-    pub fn satisfies(self, required: Scope) -> bool {
-        matches!(
-            (self, required),
-            (Scope::ReadWrite, _) | (Scope::ReadOnly, Scope::ReadOnly)
-        )
-    }
-}
-
-/// Shared auth configuration: the accepted bearer token(s) and their scopes.
-///
-/// v1 carries at most two static tokens: a required **read-write** token and an
-/// optional **read-only** token (the plan's coarse model). It is cheap to clone
-/// (the secrets sit behind an `Arc`) and is shared into the axum state.
+/// The gateway's resolved auth state: the token→principal store and the policy
+/// the principals' roles are evaluated against. Cheap to clone (shared behind an
+/// `Arc`) and handed into the axum app state.
 #[derive(Clone)]
 pub struct AuthConfig {
-    /// The read-write token (always present).
-    read_write: Arc<String>,
-    /// The optional read-only token. `None` if no `--read-token` was configured.
-    read_only: Option<Arc<String>>,
+    inner: Arc<AuthInner>,
+}
+
+struct AuthInner {
+    store: TokenStore,
+    policy: Policy,
 }
 
 impl AuthConfig {
-    /// Build an auth config with a read-write token and no read-only token.
-    pub fn new(read_write: String) -> Self {
+    /// Build an auth config with a single admin token (back-compat `--token`).
+    /// The token maps to `{subject:"admin", roles:["admin"]}`.
+    pub fn new(admin_token: String) -> Self {
+        Self::with_scopes(admin_token, None)
+    }
+
+    /// Build an auth config from the back-compat flags: the admin (`--token`)
+    /// token maps to the `admin` role; an optional read-only (`--read-token`)
+    /// token maps to the `viewer` role. A read-only token equal to the admin
+    /// token is ignored (the admin mapping wins, granting the broader role).
+    pub fn with_scopes(admin_token: String, read_token: Option<String>) -> Self {
+        let policy = Policy::builtin();
+        let mut store = TokenStore::new();
+        store.insert(
+            admin_token.clone(),
+            Principal::new("admin", ["admin".to_string()]),
+        );
+        if let Some(ro) = read_token.filter(|t| !t.is_empty() && *t != admin_token) {
+            store.insert(ro, Principal::new("reader", ["viewer".to_string()]));
+        }
         Self {
-            read_write: Arc::new(read_write),
-            read_only: None,
+            inner: Arc::new(AuthInner { store, policy }),
         }
     }
 
-    /// Build an auth config with both a read-write token and an optional
-    /// read-only token. A read-only token equal to the read-write token is
-    /// ignored (the read-write token wins, granting the broader scope).
-    pub fn with_scopes(read_write: String, read_only: Option<String>) -> Self {
-        let read_only = read_only
-            .filter(|t| !t.is_empty() && *t != read_write)
-            .map(Arc::new);
-        Self {
-            read_write: Arc::new(read_write),
-            read_only,
+    /// Build an auth config from the back-compat flags PLUS an optional
+    /// auth-config file. The file's custom roles are merged over the built-ins
+    /// and its `[[tokens]]` are registered after the back-compat flags (so a
+    /// flag token wins a duplicate-secret collision).
+    pub fn from_flags_and_config(
+        admin_token: String,
+        read_token: Option<String>,
+        config_path: Option<&Path>,
+    ) -> Result<Self, AuthConfigError> {
+        let base = Self::with_scopes(admin_token, read_token);
+        let Some(path) = config_path else {
+            return Ok(base);
+        };
+        let (file_policy, pairs) = load_auth_config(path)?;
+        // Start from the back-compat store/policy, layer the file on top.
+        let mut store = base.inner.store.clone();
+        for (token, principal) in pairs {
+            store.insert(token, principal);
         }
+        Ok(Self {
+            inner: Arc::new(AuthInner {
+                store,
+                policy: file_policy,
+            }),
+        })
     }
 
-    /// Resolve a presented bearer token to its [`Scope`], or `None` if it
-    /// matches no configured token (the caller turns that into `401`).
-    ///
-    /// The read-write token is checked first so that a token configured as both
-    /// resolves to the broader scope. Every configured token is compared in
-    /// **constant time**; an unknown token still pays a constant-time compare
-    /// against each configured token (no early bail on the first byte).
-    pub fn resolve_scope(&self, presented: &str) -> Option<Scope> {
-        // Evaluate both compares without short-circuiting so the timing does not
-        // reveal which (if any) token matched.
-        let rw = constant_time_eq(self.read_write.as_bytes(), presented.as_bytes());
-        let ro = self
-            .read_only
-            .as_ref()
-            .map(|t| constant_time_eq(t.as_bytes(), presented.as_bytes()))
-            .unwrap_or(false);
-        if rw {
-            Some(Scope::ReadWrite)
-        } else if ro {
-            Some(Scope::ReadOnly)
-        } else {
-            None
-        }
+    /// Resolve a presented bearer token to its [`Principal`] (constant-time), or
+    /// `None` if it matches no configured token (the caller turns that into a
+    /// `401`).
+    pub fn resolve(&self, presented: &str) -> Option<&Principal> {
+        self.inner.store.resolve(presented)
     }
 
-    /// Constant-time check that a presented token matches *some* configured
-    /// token (any scope). Retained for callers that only need an accept/reject
-    /// decision.
-    pub fn verify(&self, presented: &str) -> bool {
-        self.resolve_scope(presented).is_some()
+    /// Whether `principal` may exercise `perm` under this config's policy.
+    pub fn permits(&self, principal: &Principal, perm: Permission) -> bool {
+        permits(&self.inner.policy, principal, perm)
     }
 
-    /// A short, non-reversible id for a presented token, for audit logging.
-    /// Never the token itself. Stable for a given token string.
-    pub fn token_audit_id(&self) -> String {
-        short_hash(self.read_write.as_bytes())
+    /// The number of configured tokens (for startup logging).
+    pub fn token_count(&self) -> usize {
+        self.inner.store.len()
     }
-
-    /// Whether a read-only token is configured.
-    pub fn has_read_only(&self) -> bool {
-        self.read_only.is_some()
-    }
-}
-
-/// A short, non-reversible id for an arbitrary token string, for audit logging.
-/// Never the token itself.
-pub fn audit_id_for(token: &str) -> String {
-    short_hash(token.as_bytes())
-}
-
-/// Extract a bearer token from an `Authorization` header value, if it is a
-/// well-formed `Bearer <token>`.
-pub fn bearer_from_header(value: &str) -> Option<&str> {
-    let rest = value
-        .strip_prefix("Bearer ")
-        .or_else(|| value.strip_prefix("bearer "))?;
-    let token = rest.trim();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token)
-    }
-}
-
-/// Constant-time byte-slice equality. Compares over the max length so the timing
-/// does not reveal the secret's length or the position of the first difference.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    // Fold the length difference into the accumulator so unequal lengths always
-    // fail, but we still iterate a fixed function of the inputs.
-    let mut diff: u8 =
-        (a.len() as u64 ^ b.len() as u64) as u8 | ((a.len() as u64 ^ b.len() as u64) >> 8) as u8;
-    let n = a.len().max(b.len());
-    for i in 0..n {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-/// A short hex hash of a byte string (FNV-1a, 64-bit) for non-secret audit ids.
-fn short_hash(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{:016x}", hash)
 }
 
 #[cfg(test)]
@@ -175,89 +118,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn verify_accepts_exact_token() {
-        let cfg = AuthConfig::new("s3cr3t-token".to_string());
-        assert!(cfg.verify("s3cr3t-token"));
-    }
-
-    #[test]
-    fn verify_rejects_wrong_token() {
-        let cfg = AuthConfig::new("s3cr3t-token".to_string());
-        assert!(!cfg.verify("s3cr3t-toker"));
-        assert!(!cfg.verify("s3cr3t-token-extra"));
-        assert!(!cfg.verify("short"));
-        assert!(!cfg.verify(""));
-    }
-
-    #[test]
-    fn resolve_scope_single_token_is_read_write() {
+    fn admin_token_maps_to_admin_role() {
         let cfg = AuthConfig::new("rw".to_string());
-        assert_eq!(cfg.resolve_scope("rw"), Some(Scope::ReadWrite));
-        assert_eq!(cfg.resolve_scope("nope"), None);
-        assert!(!cfg.has_read_only());
+        let p = cfg.resolve("rw").expect("admin principal");
+        assert_eq!(p.subject, "admin");
+        assert!(cfg.permits(p, Permission::SessionInput));
+        assert!(cfg.permits(p, Permission::SessionKill));
+        assert!(cfg.resolve("nope").is_none());
     }
 
     #[test]
-    fn resolve_scope_with_read_only_token() {
-        let cfg = AuthConfig::with_scopes("rw-token".to_string(), Some("ro-token".to_string()));
-        assert_eq!(cfg.resolve_scope("rw-token"), Some(Scope::ReadWrite));
-        assert_eq!(cfg.resolve_scope("ro-token"), Some(Scope::ReadOnly));
-        assert_eq!(cfg.resolve_scope("bogus"), None);
-        assert!(cfg.has_read_only());
+    fn read_token_maps_to_viewer_role() {
+        let cfg = AuthConfig::with_scopes("rw".to_string(), Some("ro".to_string()));
+        let reader = cfg.resolve("ro").expect("reader principal").clone();
+        assert_eq!(reader.subject, "reader");
+        // viewer can read but not write.
+        assert!(cfg.permits(&reader, Permission::SessionRead));
+        assert!(cfg.permits(&reader, Permission::EventsRead));
+        assert!(!cfg.permits(&reader, Permission::SessionInput));
+        assert!(!cfg.permits(&reader, Permission::SessionStream));
+        // admin still has everything.
+        let admin = cfg.resolve("rw").unwrap().clone();
+        assert!(cfg.permits(&admin, Permission::SessionInput));
     }
 
     #[test]
-    fn read_only_equal_to_read_write_is_ignored() {
-        // If the same string is given for both, it resolves to the broader scope
-        // and no separate read-only token is registered.
+    fn read_token_equal_to_admin_is_ignored() {
         let cfg = AuthConfig::with_scopes("same".to_string(), Some("same".to_string()));
-        assert_eq!(cfg.resolve_scope("same"), Some(Scope::ReadWrite));
-        assert!(!cfg.has_read_only());
+        assert_eq!(cfg.token_count(), 1);
+        assert_eq!(cfg.resolve("same").unwrap().subject, "admin");
     }
 
     #[test]
-    fn empty_read_only_is_ignored() {
+    fn empty_read_token_is_ignored() {
         let cfg = AuthConfig::with_scopes("rw".to_string(), Some(String::new()));
-        assert!(!cfg.has_read_only());
-        assert_eq!(cfg.resolve_scope("rw"), Some(Scope::ReadWrite));
+        assert_eq!(cfg.token_count(), 1);
     }
 
     #[test]
-    fn scope_satisfies_matrix() {
-        assert!(Scope::ReadWrite.satisfies(Scope::ReadWrite));
-        assert!(Scope::ReadWrite.satisfies(Scope::ReadOnly));
-        assert!(Scope::ReadOnly.satisfies(Scope::ReadOnly));
-        assert!(!Scope::ReadOnly.satisfies(Scope::ReadWrite));
-    }
+    fn config_file_adds_custom_role_tokens() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("remux-gw-auth-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"
+                [[tokens]]
+                token = "dep-token"
+                subject = "deployer-bot"
+                roles = ["deployer"]
 
-    #[test]
-    fn constant_time_eq_basic() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-        assert!(!constant_time_eq(b"", b"x"));
-        assert!(constant_time_eq(b"", b""));
-    }
+                [[roles]]
+                name = "deployer"
+                permissions = ["session.create", "session.input", "session.read"]
+            "#,
+        )
+        .unwrap();
+        let cfg = AuthConfig::from_flags_and_config("rw".to_string(), None, Some(path.as_path()))
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
 
-    #[test]
-    fn bearer_parsing() {
-        assert_eq!(bearer_from_header("Bearer abc123"), Some("abc123"));
-        assert_eq!(bearer_from_header("bearer abc123"), Some("abc123"));
-        assert_eq!(bearer_from_header("Bearer  spaced  "), Some("spaced"));
-        assert_eq!(bearer_from_header("Basic xyz"), None);
-        assert_eq!(bearer_from_header("Bearer "), None);
-        assert_eq!(bearer_from_header("abc"), None);
-    }
+        // Back-compat admin token still works.
+        let admin = cfg.resolve("rw").unwrap().clone();
+        assert!(cfg.permits(&admin, Permission::SessionKill));
 
-    #[test]
-    fn audit_id_is_stable_and_not_the_token() {
-        let cfg = AuthConfig::new("my-token".to_string());
-        let id = cfg.token_audit_id();
-        assert_eq!(id.len(), 16);
-        assert_ne!(id, "my-token");
-        // Stable across calls.
-        assert_eq!(id, cfg.token_audit_id());
-        // The free function agrees with the config method for the same token.
-        assert_eq!(id, audit_id_for("my-token"));
+        // Custom deployer can create+input but not kill.
+        let dep = cfg.resolve("dep-token").expect("deployer").clone();
+        assert!(cfg.permits(&dep, Permission::SessionCreate));
+        assert!(cfg.permits(&dep, Permission::SessionInput));
+        assert!(cfg.permits(&dep, Permission::SessionRead));
+        assert!(!cfg.permits(&dep, Permission::SessionKill));
     }
 }

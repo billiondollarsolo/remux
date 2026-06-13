@@ -120,6 +120,63 @@ pub async fn start_control_plane() -> ControlPlaneHandle {
     }
 }
 
+/// A bearer token bound to the built-in `fleet-viewer` role via an auth-config
+/// file (the principal/permission test). Can list/read but not resolve.
+pub const FLEET_VIEWER_TOKEN: &str = "cp-fleet-viewer-token-555";
+
+/// Start the control plane with the back-compat [`ADMIN_TOKEN`]/[`REGISTER_TOKEN`]
+/// PLUS an auth-config file binding [`FLEET_VIEWER_TOKEN`] to the built-in
+/// `fleet-viewer` role. Returns the handle and the viewer token. The temp config
+/// file is removed once loaded.
+pub async fn start_control_plane_with_auth_config() -> (ControlPlaneHandle, String) {
+    ensure_crypto_provider();
+    let tls = CpTls::generate_self_signed().expect("cp self-signed cert");
+    let rustls_config = tls.into_rustls_config().await.expect("cp rustls config");
+    let (listener, addr) =
+        remux_control_plane::server::bind_listener("127.0.0.1:0".parse().unwrap())
+            .expect("bind control-plane port");
+
+    let path = std::env::temp_dir().join(format!(
+        "remux-cp-e2e-auth-{}-{}.toml",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+                [[tokens]]
+                token = "{FLEET_VIEWER_TOKEN}"
+                subject = "dashboard"
+                roles = ["fleet-viewer"]
+            "#
+        ),
+    )
+    .expect("write cp auth-config");
+    let auth = CpAuth::from_flags_and_config(
+        ADMIN_TOKEN.to_string(),
+        REGISTER_TOKEN.to_string(),
+        Some(path.as_path()),
+    )
+    .expect("load cp auth-config");
+    let _ = std::fs::remove_file(&path);
+
+    let state = CpState::new(auth)
+        .with_gateway_tls_insecure(true)
+        .with_gateway_timeout(Duration::from_secs(3));
+    tokio::spawn(async move {
+        let _ = remux_control_plane::server::serve(listener, rustls_config, state).await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    (
+        ControlPlaneHandle {
+            addr,
+            base_url: format!("https://{addr}"),
+        },
+        FLEET_VIEWER_TOKEN.to_string(),
+    )
+}
+
 /// A reqwest client that accepts self-signed certs (the gateways and CP use them).
 pub fn client() -> reqwest::Client {
     reqwest::Client::builder()

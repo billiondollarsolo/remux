@@ -20,7 +20,7 @@ use tokio::task::JoinSet;
 
 use remux_gateway::dto::{CreateSessionBody, SessionView, SizeBody};
 
-use crate::auth::{audit_id_for, bearer_from_header, AuthConfig, TokenKind};
+use crate::auth::{audit_id_for, bearer_from_header, AuthConfig, Permission, Principal};
 use crate::client::GatewayClient;
 use crate::registry::{HostEntry, HostView, Registry, DEFAULT_TTL};
 
@@ -74,37 +74,59 @@ impl AppState {
 /// Identity resolved by the auth middleware, stashed for the audit layer.
 #[derive(Clone)]
 struct AuthContext {
-    kind: TokenKind,
+    subject: String,
+    roles: String,
     token_id: String,
 }
 
-/// Build the full `/cp/v1` router with the two-token auth groups + audit layer.
+/// Build the full `/cp/v1` router with **per-route permission** enforcement (the
+/// shared [`remux_authz`] RBAC model) + audit layer.
+///
+/// Each route group declares the [`Permission`] it requires; a middleware
+/// resolves the bearer to a [`Principal`] (else `401`) and rejects a principal
+/// lacking the permission with `403`.
 pub fn router(state: AppState) -> Router {
-    // Register-token routes: a gateway joins / refreshes / leaves.
+    // A one-route-group guard: enforce `perm` before the inner routes run.
+    let guard = |perm: Permission| {
+        let state = state.clone();
+        middleware::from_fn_with_state(
+            state,
+            move |State(st): State<AppState>, req: Request, next: Next| {
+                enforce_permission(st, perm, req, next)
+            },
+        )
+    };
+
+    // Registration surface: register / heartbeat / deregister.
     let register_routes = Router::new()
         .route("/register", post(register))
         .route("/heartbeat", post(heartbeat))
         .route("/hosts/:name", delete(deregister))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_register_token,
-        ));
+        .layer(guard(Permission::HostRegister));
 
-    // Admin-token routes: read the fleet, federate, resolve.
-    let admin_routes = Router::new()
+    // Fleet API: read hosts, read federated sessions, resolve.
+    let hosts = Router::new()
         .route("/hosts", get(list_hosts))
+        .layer(guard(Permission::FleetHostsRead));
+    let sessions = Router::new()
         .route("/sessions", get(federated_sessions))
+        .layer(guard(Permission::FleetSessionsRead));
+    let resolve_route = Router::new()
         .route("/resolve", post(resolve))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_admin_token,
-        ));
+        .layer(guard(Permission::FleetResolve));
 
     // Public (no auth): health.
     let public = Router::new().route("/health", get(health));
 
     Router::new()
-        .nest("/cp/v1", public.merge(register_routes).merge(admin_routes))
+        .nest(
+            "/cp/v1",
+            public
+                .merge(register_routes)
+                .merge(hosts)
+                .merge(sessions)
+                .merge(resolve_route),
+        )
         .layer(middleware::from_fn(audit_layer))
         .with_state(state)
 }
@@ -113,41 +135,40 @@ pub fn router(state: AppState) -> Router {
 // Auth + audit middleware
 // ---------------------------------------------------------------------------
 
-async fn require_admin_token(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    enforce_token(state, TokenKind::Admin, request, next).await
-}
-
-async fn require_register_token(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    enforce_token(state, TokenKind::Register, request, next).await
-}
-
-/// Deny-by-default: resolve the presented bearer against the required token kind;
-/// a missing/wrong token is `401`.
-async fn enforce_token(
+/// Deny-by-default: resolve the presented bearer to a [`Principal`] and enforce
+/// `required`. A missing/unknown token is `401`; a known principal lacking the
+/// permission is `403`.
+async fn enforce_permission(
     state: AppState,
-    kind: TokenKind,
+    required: Permission,
     mut request: Request,
     next: Next,
 ) -> Response {
     let presented = extract_token(request.headers());
-    let ok = presented
-        .as_deref()
-        .map(|t| state.auth.verify(kind, t))
-        .unwrap_or(false);
-    if !ok {
-        let body = json!({ "error": "missing or invalid bearer token", "kind": "unauthorized" });
-        return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+    let principal: Principal = match presented.as_deref().and_then(|t| state.auth.resolve(t)) {
+        Some(p) => p.clone(),
+        None => {
+            let body =
+                json!({ "error": "missing or invalid bearer token", "kind": "unauthorized" });
+            return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+        }
+    };
+    if !state.auth.permits(&principal, required) {
+        let body = json!({
+            "error": format!(
+                "principal {:?} lacks the {} permission required for this endpoint",
+                principal.subject, required
+            ),
+            "kind": "forbidden",
+        });
+        return (StatusCode::FORBIDDEN, Json(body)).into_response();
     }
     let token_id = presented.as_deref().map(audit_id_for).unwrap_or_default();
-    let ctx = AuthContext { kind, token_id };
+    let ctx = AuthContext {
+        subject: principal.subject.clone(),
+        roles: principal.roles_display(),
+        token_id,
+    };
     request.extensions_mut().insert(ctx.clone());
     let mut response = next.run(request).await;
     response.extensions_mut().insert(ctx);
@@ -155,8 +176,8 @@ async fn enforce_token(
 }
 
 /// Per-request audit middleware: one structured `tracing` line per `/cp/v1`
-/// request (method, matched path, status, token kind, hashed token id, peer,
-/// latency — never the raw token).
+/// request (method, matched path, status, principal subject + roles, hashed
+/// token id, peer, latency — never the raw token).
 async fn audit_layer(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let path = request
@@ -174,9 +195,13 @@ async fn audit_layer(request: Request, next: Next) -> Response {
     let response = next.run(request).await;
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    let (kind, token_id) = match response.extensions().get::<AuthContext>() {
-        Some(ctx) => (ctx.kind.as_str(), ctx.token_id.clone()),
-        None => ("anonymous", "anonymous".to_string()),
+    let (subject, roles, token_id) = match response.extensions().get::<AuthContext>() {
+        Some(ctx) => (ctx.subject.clone(), ctx.roles.clone(), ctx.token_id.clone()),
+        None => (
+            "anonymous".to_string(),
+            String::new(),
+            "anonymous".to_string(),
+        ),
     };
 
     tracing::info!(
@@ -184,7 +209,8 @@ async fn audit_layer(request: Request, next: Next) -> Response {
         method = %method,
         path = %path,
         status = response.status().as_u16(),
-        token_kind = kind,
+        subject = %subject,
+        roles = %roles,
         token_id = %token_id,
         remote = %remote,
         latency_ms = format!("{latency_ms:.2}"),

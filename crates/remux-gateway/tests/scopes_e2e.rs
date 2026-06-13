@@ -1,13 +1,15 @@
-//! Scope-enforcement end-to-end (AW4 hardening): a real `remuxd` + a real
-//! `remux-gateway` over TLS, configured with both a read-write and a read-only
-//! token.
+//! Principal + permission-enforcement end-to-end (AW4 hardening, Phase A RBAC):
+//! a real `remuxd` + a real `remux-gateway` over TLS, configured with the
+//! back-compat admin token (→ `admin` role) and read-only token (→ `viewer`
+//! role), plus a custom-role-via-auth-config gateway.
 //!
 //! Asserts the enforcement matrix:
-//! - read-only token: `GET /v1/sessions` → 200; `POST /v1/sessions` and
-//!   `POST .../input` → 403.
-//! - read-write token: both work.
+//! - viewer token: `GET /v1/sessions` → 200; `POST /v1/sessions` and
+//!   `POST .../input` → 403 (`forbidden`); `DELETE` (admin-only) → 403.
+//! - admin token: all of the above work.
 //! - bogus token → 401.
-//! - read-only token on `/stream` WS → rejected; on `/events` WS → accepted.
+//! - viewer token on `/stream` WS → rejected; on `/events` WS → accepted.
+//! - a custom `deployer` token (auth-config) can create + input but NOT kill.
 
 mod common;
 
@@ -15,7 +17,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
-    ensure_crypto_provider, start_gateway_with_scopes, start_harness, TEST_READ_TOKEN, TEST_TOKEN,
+    ensure_crypto_provider, start_gateway_with_auth_config, start_gateway_with_scopes,
+    start_harness, TEST_DEPLOYER_TOKEN, TEST_READ_TOKEN, TEST_TOKEN,
 };
 use serde_json::json;
 use tokio_tungstenite::Connector;
@@ -161,6 +164,17 @@ async fn read_only_token_can_read_but_not_write() {
         .expect("ro screen");
     assert_eq!(resp.status(), 200, "read token reading screen must be 200");
 
+    // --- viewer cannot DELETE (kill) -> 403 (a write/admin-tier permission) ---
+    let resp = http
+        .delete(format!("{base}/v1/sessions/{id}"))
+        .bearer_auth(TEST_READ_TOKEN)
+        .send()
+        .await
+        .expect("ro delete");
+    assert_eq!(resp.status(), 403, "read token killing must be 403");
+    let body: serde_json::Value = resp.json().await.expect("403 json");
+    assert_eq!(body["kind"], "forbidden", "403 body: {body}");
+
     // Cleanup with the read-write token.
     let _ = http
         .delete(format!("{base}/v1/sessions/{id}"))
@@ -228,4 +242,67 @@ async fn read_only_token_rejected_on_stream_accepted_on_events() {
         .bearer_auth(TEST_TOKEN)
         .send()
         .await;
+}
+
+#[tokio::test]
+async fn custom_deployer_role_can_create_and_input_but_not_kill() {
+    let harness = start_harness().await;
+    let gw = start_gateway_with_auth_config(harness.socket_path().to_path_buf()).await;
+    let http = client();
+    let base = &gw.base_url;
+
+    // --- deployer can create (custom role grants session.create) -> 201 ---
+    let resp = http
+        .post(format!("{base}/v1/sessions"))
+        .bearer_auth(TEST_DEPLOYER_TOKEN)
+        .json(&json!({ "name": "deployer-e2e", "command": ["/bin/sh"] }))
+        .send()
+        .await
+        .expect("deployer create");
+    assert_eq!(resp.status(), 201, "deployer must create (201)");
+    let id = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // --- deployer can input (custom role grants session.input) -> 202 ---
+    let resp = http
+        .post(format!("{base}/v1/sessions/{id}/input"))
+        .bearer_auth(TEST_DEPLOYER_TOKEN)
+        .json(&json!({ "text": "echo ok\n" }))
+        .send()
+        .await
+        .expect("deployer input");
+    assert_eq!(resp.status(), 202, "deployer input must be 202");
+
+    // --- deployer can read (custom role grants session.read) -> 200 ---
+    let resp = http
+        .get(format!("{base}/v1/sessions/{id}/screen"))
+        .bearer_auth(TEST_DEPLOYER_TOKEN)
+        .send()
+        .await
+        .expect("deployer screen");
+    assert_eq!(resp.status(), 200, "deployer read must be 200");
+
+    // --- deployer CANNOT kill (custom role lacks session.kill) -> 403 ---
+    let resp = http
+        .delete(format!("{base}/v1/sessions/{id}"))
+        .bearer_auth(TEST_DEPLOYER_TOKEN)
+        .send()
+        .await
+        .expect("deployer delete");
+    assert_eq!(resp.status(), 403, "deployer killing must be 403");
+    let body: serde_json::Value = resp.json().await.expect("403 json");
+    assert_eq!(body["kind"], "forbidden", "403 body: {body}");
+
+    // --- the admin token still works (back-compat) and cleans up ---
+    let resp = http
+        .delete(format!("{base}/v1/sessions/{id}"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .expect("admin delete");
+    assert_eq!(resp.status(), 204, "admin kill must be 204 (back-compat)");
 }

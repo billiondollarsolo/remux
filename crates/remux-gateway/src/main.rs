@@ -42,9 +42,17 @@ struct Cli {
 
     /// Optional bearer token granting **read-only** access (observe-only
     /// endpoints + the `/events` WS; rejected with 403 on any write route).
-    /// Falls back to `REMUX_GATEWAY_READ_TOKEN`.
+    /// Maps to the built-in `viewer` role. Falls back to
+    /// `REMUX_GATEWAY_READ_TOKEN`.
     #[arg(long, env = "REMUX_GATEWAY_READ_TOKEN")]
     read_token: Option<String>,
+
+    /// Optional path to a TOML auth-config file adding principal-shaped tokens
+    /// and custom roles (RBAC). Merged over the back-compat `--token` /
+    /// `--read-token` flags and the built-in roles. Falls back to
+    /// `REMUX_GATEWAY_AUTH_CONFIG`.
+    #[arg(long, value_name = "FILE", env = "REMUX_GATEWAY_AUTH_CONFIG")]
+    auth_config: Option<PathBuf>,
 
     /// TLS certificate (PEM). Must be paired with `--tls-key`. If both are
     /// omitted, a self-signed cert is generated for `127.0.0.1`/`localhost`.
@@ -190,9 +198,14 @@ async fn run(cli: Cli) -> Result<(), String> {
         _ => (generate_token(), true),
     };
     // Optional read-only token. A value equal to the read-write token is ignored
-    // (the read-write token wins, granting the broader scope).
+    // (the admin mapping wins, granting the broader `admin` role).
     let read_token = cli.read_token.filter(|t| !t.is_empty());
-    let auth = AuthConfig::with_scopes(token.clone(), read_token.clone());
+    let auth = AuthConfig::from_flags_and_config(
+        token.clone(),
+        read_token.clone(),
+        cli.auth_config.as_deref(),
+    )
+    .map_err(|e| format!("auth config: {e}"))?;
 
     // Resolve TLS material (operator PEM or self-signed for loopback).
     let tls = TlsMaterial::resolve(cli.tls_cert, cli.tls_key)?;
@@ -231,12 +244,15 @@ async fn run(cli: Cli) -> Result<(), String> {
         tracing::info!("using bearer token from --token/REMUX_GATEWAY_TOKEN");
     }
     tracing::info!(
-        token_id = %auth.token_audit_id(),
-        read_only_token = auth.has_read_only(),
-        "bearer auth active (deny-by-default; read-write + optional read-only scopes)"
+        token_id = %remux_gateway::auth::audit_id_for(&token),
+        token_count = auth.token_count(),
+        "bearer auth active (deny-by-default; RBAC principals: admin token -> `admin` role)"
     );
     if read_token.is_some() {
-        tracing::info!("read-only token configured (observe-only scope)");
+        tracing::info!("read-only token configured (`viewer` role)");
+    }
+    if cli.auth_config.is_some() {
+        tracing::info!("auth-config file loaded (principal-shaped tokens + custom roles)");
     }
 
     if cli.no_web_ui {

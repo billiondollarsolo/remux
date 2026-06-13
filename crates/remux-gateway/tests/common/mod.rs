@@ -81,10 +81,48 @@ pub async fn start_gateway(socket_path: PathBuf) -> GatewayHandle {
     start_gateway_with_auth(socket_path, AuthConfig::new(TEST_TOKEN.to_string())).await
 }
 
-/// Start the gateway with both the read-write [`TEST_TOKEN`] and the read-only
-/// [`TEST_READ_TOKEN`] configured (for scope-enforcement tests).
+/// Start the gateway with both the admin [`TEST_TOKEN`] (→ `admin` role) and the
+/// read-only [`TEST_READ_TOKEN`] (→ `viewer` role) configured (for the
+/// principal/permission-enforcement tests).
 pub async fn start_gateway_with_scopes(socket_path: PathBuf) -> GatewayHandle {
     let auth = AuthConfig::with_scopes(TEST_TOKEN.to_string(), Some(TEST_READ_TOKEN.to_string()));
+    start_gateway_with_auth(socket_path, auth).await
+}
+
+/// The bearer token bound to a custom `deployer` role via an auth-config file
+/// (the principal-via-config test). The deployer can create + input + read, but
+/// NOT kill.
+pub const TEST_DEPLOYER_TOKEN: &str = "test-gateway-deployer-token-777";
+
+/// Start the gateway with the admin [`TEST_TOKEN`] PLUS an auth-config file that
+/// defines a custom `deployer` role and binds [`TEST_DEPLOYER_TOKEN`] to it.
+/// Returns the gateway handle; the temp config file is removed once loaded.
+pub async fn start_gateway_with_auth_config(socket_path: PathBuf) -> GatewayHandle {
+    let path = std::env::temp_dir().join(format!(
+        "remux-gw-e2e-auth-{}-{}.toml",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+                [[tokens]]
+                token = "{TEST_DEPLOYER_TOKEN}"
+                subject = "deployer-bot"
+                roles = ["deployer"]
+
+                [[roles]]
+                name = "deployer"
+                permissions = ["session.create", "session.input", "session.read", "session.list"]
+            "#
+        ),
+    )
+    .expect("write auth-config");
+    let auth =
+        AuthConfig::from_flags_and_config(TEST_TOKEN.to_string(), None, Some(path.as_path()))
+            .expect("load auth-config");
+    let _ = std::fs::remove_file(&path);
     start_gateway_with_auth(socket_path, auth).await
 }
 

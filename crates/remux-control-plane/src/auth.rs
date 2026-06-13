@@ -1,116 +1,104 @@
-//! Bearer-token auth for the control plane (deny-by-default, constant-time
-//! compare), mirroring the gateway's AW4 posture.
+//! Bearer-token auth + **principal + RBAC** authorization for the control plane
+//! (Phase A), mirroring the gateway's posture via the shared [`remux_authz`]
+//! model.
 //!
-//! The control plane resolves **two** distinct tokens per route group:
-//! - the **admin** token guards the fleet API (`GET /cp/v1/hosts`,
-//!   `GET /cp/v1/sessions`, `POST /cp/v1/resolve`);
-//! - the **register** token guards the registration surface a gateway uses to
-//!   join (`POST /cp/v1/register`, `POST /cp/v1/heartbeat`,
-//!   `DELETE /cp/v1/hosts/{name}`).
+//! A presented token resolves (in **constant time**) to a [`Principal`] whose
+//! roles are evaluated against a [`Policy`]. Each route declares a required
+//! [`Permission`]: a missing/unknown token is `401`, a known principal lacking
+//! the permission is `403`.
 //!
-//! Separating them lets an operator hand each gateway only the lower-privilege
-//! register token while keeping the admin (read-the-whole-fleet) token closely
-//! held. Tokens are never logged in the clear; the audit line logs a short,
+//! Back-compat: `--token` (the admin/fleet token) maps to principal
+//! `{subject:"fleet-admin", roles:["fleet-admin"]}`; `--register-token` maps to
+//! `{subject:"registrar", roles:["registrar"]}`. An optional `--auth-config`
+//! file adds further principal-shaped tokens and custom roles. Tokens are never
+//! logged in the clear; the audit line logs the subject, roles, and a short,
 //! non-reversible id.
 
+use std::path::Path;
 use std::sync::Arc;
 
-/// Which token group a route requires.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenKind {
-    /// The fleet/admin token (list hosts, federated sessions, resolve).
-    Admin,
-    /// The registration token (register, heartbeat, deregister).
-    Register,
-}
+pub use remux_authz::{
+    audit_id_for, bearer_from_header, load_auth_config, permits, AuthConfigError, Permission,
+    Policy, Principal, TokenStore,
+};
 
-impl TokenKind {
-    /// The audit-log string for this token kind.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TokenKind::Admin => "admin",
-            TokenKind::Register => "register",
-        }
-    }
-}
-
-/// The shared auth config: the admin and register tokens.
+/// The control plane's resolved auth state: the token→principal store and the
+/// policy its principals' roles are evaluated against. Cheap to clone.
 #[derive(Clone)]
 pub struct AuthConfig {
-    admin: Arc<String>,
-    register: Arc<String>,
+    inner: Arc<AuthInner>,
+}
+
+struct AuthInner {
+    store: TokenStore,
+    policy: Policy,
 }
 
 impl AuthConfig {
-    /// Build an auth config from the admin and register tokens.
+    /// Build an auth config from the back-compat tokens: the admin (`--token`)
+    /// token maps to the `fleet-admin` role; the register (`--register-token`)
+    /// token maps to the `registrar` role. An empty register token (or one equal
+    /// to the admin token) is ignored.
     pub fn new(admin: String, register: String) -> Self {
+        let policy = Policy::builtin();
+        let mut store = TokenStore::new();
+        store.insert(
+            admin.clone(),
+            Principal::new("fleet-admin", ["fleet-admin".to_string()]),
+        );
+        if !register.is_empty() && register != admin {
+            store.insert(
+                register,
+                Principal::new("registrar", ["registrar".to_string()]),
+            );
+        }
         Self {
-            admin: Arc::new(admin),
-            register: Arc::new(register),
+            inner: Arc::new(AuthInner { store, policy }),
         }
     }
 
-    /// Constant-time check that `presented` matches the token for `kind`.
-    pub fn verify(&self, kind: TokenKind, presented: &str) -> bool {
-        let expected = match kind {
-            TokenKind::Admin => self.admin.as_bytes(),
-            TokenKind::Register => self.register.as_bytes(),
+    /// Build an auth config from the back-compat tokens PLUS an optional
+    /// auth-config file. The file's custom roles are merged over the built-ins;
+    /// its `[[tokens]]` are registered after the back-compat tokens (so a flag
+    /// token wins a duplicate-secret collision).
+    pub fn from_flags_and_config(
+        admin: String,
+        register: String,
+        config_path: Option<&Path>,
+    ) -> Result<Self, AuthConfigError> {
+        let base = Self::new(admin, register);
+        let Some(path) = config_path else {
+            return Ok(base);
         };
-        constant_time_eq(expected, presented.as_bytes())
+        let (file_policy, pairs) = load_auth_config(path)?;
+        let mut store = base.inner.store.clone();
+        for (token, principal) in pairs {
+            store.insert(token, principal);
+        }
+        Ok(Self {
+            inner: Arc::new(AuthInner {
+                store,
+                policy: file_policy,
+            }),
+        })
     }
 
-    /// A short, non-reversible audit id for the admin token (for the startup log).
-    pub fn admin_audit_id(&self) -> String {
-        short_hash(self.admin.as_bytes())
+    /// Resolve a presented bearer token to its [`Principal`] (constant-time), or
+    /// `None` if it matches no configured token (the caller turns that into a
+    /// `401`).
+    pub fn resolve(&self, presented: &str) -> Option<&Principal> {
+        self.inner.store.resolve(presented)
     }
 
-    /// A short, non-reversible audit id for the register token.
-    pub fn register_audit_id(&self) -> String {
-        short_hash(self.register.as_bytes())
+    /// Whether `principal` may exercise `perm` under this config's policy.
+    pub fn permits(&self, principal: &Principal, perm: Permission) -> bool {
+        permits(&self.inner.policy, principal, perm)
     }
-}
 
-/// A short, non-reversible id for an arbitrary token string, for audit logging.
-/// Never the token itself.
-pub fn audit_id_for(token: &str) -> String {
-    short_hash(token.as_bytes())
-}
-
-/// Extract a bearer token from an `Authorization: Bearer <token>` header value.
-pub fn bearer_from_header(value: &str) -> Option<&str> {
-    let rest = value
-        .strip_prefix("Bearer ")
-        .or_else(|| value.strip_prefix("bearer "))?;
-    let token = rest.trim();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token)
+    /// The number of configured tokens (for startup logging).
+    pub fn token_count(&self) -> usize {
+        self.inner.store.len()
     }
-}
-
-/// Constant-time byte-slice equality (folds the length difference in so unequal
-/// lengths always fail without revealing the secret's length or first diff).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff: u8 =
-        (a.len() as u64 ^ b.len() as u64) as u8 | ((a.len() as u64 ^ b.len() as u64) >> 8) as u8;
-    let n = a.len().max(b.len());
-    for i in 0..n {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-/// A short hex hash (FNV-1a, 64-bit) for non-secret audit ids.
-fn short_hash(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{:016x}", hash)
 }
 
 #[cfg(test)]
@@ -118,39 +106,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn admin_and_register_are_distinct() {
+    fn admin_maps_to_fleet_admin_register_to_registrar() {
         let cfg = AuthConfig::new("admin-tok".into(), "reg-tok".into());
-        assert!(cfg.verify(TokenKind::Admin, "admin-tok"));
-        assert!(!cfg.verify(TokenKind::Admin, "reg-tok"));
-        assert!(cfg.verify(TokenKind::Register, "reg-tok"));
-        assert!(!cfg.verify(TokenKind::Register, "admin-tok"));
-        assert!(!cfg.verify(TokenKind::Admin, ""));
-        assert!(!cfg.verify(TokenKind::Register, "nope"));
+
+        let admin = cfg.resolve("admin-tok").expect("admin").clone();
+        assert_eq!(admin.subject, "fleet-admin");
+        // fleet-admin has every CP permission.
+        for perm in [
+            Permission::FleetHostsRead,
+            Permission::FleetSessionsRead,
+            Permission::FleetResolve,
+            Permission::HostRegister,
+        ] {
+            assert!(
+                cfg.permits(&admin, perm),
+                "fleet-admin should permit {perm}"
+            );
+        }
+
+        let reg = cfg.resolve("reg-tok").expect("registrar").clone();
+        assert_eq!(reg.subject, "registrar");
+        // registrar can only register/heartbeat/deregister.
+        assert!(cfg.permits(&reg, Permission::HostRegister));
+        assert!(!cfg.permits(&reg, Permission::FleetHostsRead));
+        assert!(!cfg.permits(&reg, Permission::FleetResolve));
+
+        assert!(cfg.resolve("nope").is_none());
     }
 
     #[test]
-    fn bearer_parsing() {
-        assert_eq!(bearer_from_header("Bearer abc123"), Some("abc123"));
-        assert_eq!(bearer_from_header("bearer abc123"), Some("abc123"));
-        assert_eq!(bearer_from_header("Basic xyz"), None);
-        assert_eq!(bearer_from_header("Bearer "), None);
+    fn register_equal_to_admin_is_ignored() {
+        let cfg = AuthConfig::new("same".into(), "same".into());
+        assert_eq!(cfg.token_count(), 1);
+        assert_eq!(cfg.resolve("same").unwrap().subject, "fleet-admin");
     }
 
     #[test]
-    fn constant_time_eq_basic() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-        assert!(constant_time_eq(b"", b""));
-    }
+    fn config_file_adds_fleet_viewer_token() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("remux-cp-auth-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"
+                [[tokens]]
+                token = "viewer-token"
+                subject = "dash"
+                roles = ["fleet-viewer"]
+            "#,
+        )
+        .unwrap();
+        let cfg =
+            AuthConfig::from_flags_and_config("admin".into(), "reg".into(), Some(path.as_path()))
+                .unwrap();
+        let _ = std::fs::remove_file(&path);
 
-    #[test]
-    fn audit_id_is_stable_and_not_the_token() {
-        let cfg = AuthConfig::new("my-admin".into(), "my-reg".into());
-        let id = cfg.admin_audit_id();
-        assert_eq!(id.len(), 16);
-        assert_ne!(id, "my-admin");
-        assert_eq!(id, audit_id_for("my-admin"));
-        assert_ne!(cfg.admin_audit_id(), cfg.register_audit_id());
+        let v = cfg.resolve("viewer-token").expect("fleet-viewer").clone();
+        assert!(cfg.permits(&v, Permission::FleetHostsRead));
+        assert!(cfg.permits(&v, Permission::FleetSessionsRead));
+        // fleet-viewer cannot resolve.
+        assert!(!cfg.permits(&v, Permission::FleetResolve));
     }
 }

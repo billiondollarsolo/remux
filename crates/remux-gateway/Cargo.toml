@@ -14,6 +14,7 @@ path = "src/lib.rs"
 
 [dependencies]
 remux-core = { path = "../remux-core" }
+remux-authz = { path = "../remux-authz" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }

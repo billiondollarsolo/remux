@@ -705,13 +705,43 @@ to "just open a port on remuxd."
 - **Audit log:** structured `tracing` line per request (token id hash, method,
   session, outcome) — the seed of the fleet-phase audit trail.
 
-### 6.3 Deferred to the fleet/control-plane phase (AW6)
+### 6.3 Auth hardening Phase A — principal + RBAC ✅ **SHIPPED**
 
-OIDC / JWT, mTLS, fine-grained **RBAC**, per-org/team policy, short-lived
-credentials, and full audit pipelines are explicitly **out of scope for v1** and
-land with the control plane (`spec.md` §11 "Fleet: RBAC, audit logs"). v1's
-coarse token model is forward-compatible: a token becomes a degenerate principal;
-scopes become RBAC permissions.
+The coarse read/read-write scope split has been replaced by a **principal +
+RBAC** model shared by the gateway AND the control plane, in the new
+`crates/remux-authz` crate (pure, no network, unit-tested). This is Phase A of
+auth hardening; Phases B (OIDC/JWT) and C (mTLS + cert pinning) plug INTO this
+model.
+
+- **Fine-grained permissions** spanning both surfaces, each with a stable string
+  name (`"session.read"`, `"fleet.resolve"`, `"host.register"`, …):
+  gateway — `session.list/read/create/input/resize/kill/rename/stream/wait`,
+  `events.read`; control plane — `fleet.hosts.read`, `fleet.sessions.read`,
+  `fleet.resolve`, `host.register`.
+- **Roles** = named permission sets; a **Policy** maps role names → roles.
+  Built-in roles: gateway `viewer ⊂ operator ⊂ admin`; control plane
+  `registrar`, `fleet-viewer ⊂ fleet-operator ⊂ fleet-admin`.
+- **Principals** (`{subject, roles}`) come from a constant-time `TokenStore`
+  (bearer token → principal). `permits(policy, principal, perm)` unions the
+  principal's known roles' permissions; an unknown role grants nothing (logged,
+  deny-by-default).
+- **Back-compat:** the gateway's `--token` → principal `{admin, [admin]}` and
+  `--read-token` → `{reader, [viewer]}`; the control plane's `--token` →
+  `{fleet-admin, [fleet-admin]}` and `--register-token` → `{registrar,
+  [registrar]}`. An optional `--auth-config <FILE>` (env
+  `REMUX_GATEWAY_AUTH_CONFIG` / `REMUX_CP_AUTH_CONFIG`) adds principal-shaped
+  tokens and custom roles.
+- **401 vs 403 preserved:** unknown/missing token → `401`; a known principal
+  lacking the route's permission → `403`. Audit lines now carry the principal's
+  `subject` + `roles` alongside the hashed `token_id` (never the raw token).
+
+### 6.4 Deferred to the remaining hardening phases (B/C)
+
+OIDC / JWT (Phase B) and mTLS + gateway-cert pinning / CA trust (Phase C),
+per-org/team policy, short-lived credentials, and full audit pipelines remain
+**deferred**. They are now *additive*: each is simply another way to produce a
+`remux_authz::Principal`; the `Policy`/`permits` decision and the audit shape are
+unchanged. (`spec.md` §11 "Fleet: RBAC, audit logs".)
 
 ### 6.4 Tests
 
@@ -754,9 +784,21 @@ scopes become RBAC permissions.
       and latency in ms. WS connect/disconnect are covered by the same layer (the
       upgrade request is a `/v1` request). No secret material is logged; asserted
       in `tests/audit_e2e.rs`.
-- [x] OIDC/JWT/mTLS/fine-grained **RBAC** documented as deferred to AW6 (§6.3).
-      v1 ships the coarse read/read-write scope split; scopes upgrade to RBAC
-      permissions and tokens to principals without a redesign.
+- [x] **Fine-grained RBAC / principal-scoped tokens — SHIPPED** (Phase A, §6.3).
+      The coarse read/read-write scope split has been replaced by the shared
+      `crates/remux-authz` principal + RBAC model across BOTH the gateway and the
+      control plane: fine-grained `Permission`s, built-in `viewer`/`operator`/
+      `admin` (gateway) and `registrar`/`fleet-viewer`/`fleet-operator`/
+      `fleet-admin` (control plane) roles, a `Policy`, `Principal`s, and a
+      constant-time `TokenStore`, with an optional `--auth-config` file for
+      principal-shaped tokens + custom roles. Back-compat token flags preserved;
+      401-vs-403 semantics preserved; audit lines extended with subject + roles.
+      Tested in `remux-authz` unit tests, `tests/scopes_e2e.rs`, and
+      `tests/federation_e2e.rs`.
+- [x] OIDC/JWT (Phase B) and mTLS + cert-pinning (Phase C) documented as the
+      remaining deferred work (§6.4). They are additive: each produces a
+      `remux_authz::Principal` and reuses the shipped `Policy`/`permits` decision
+      and audit shape unchanged.
 
 ---
 

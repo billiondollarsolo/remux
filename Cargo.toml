@@ -5,6 +5,7 @@ members = [
     "crates/remux-cli",
     "crates/remux-tui",
     "crates/remux-testkit",
+    "crates/remux-authz",
     "crates/remux-gateway",
     "crates/remux-control-plane",
 ]

@@ -1714,6 +1714,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "remux-authz"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "toml",
+]
+
+[[package]]
 name = "remux-cli"
 version = "0.1.0"
 dependencies = [
@@ -1746,6 +1756,7 @@ dependencies = [
  "chrono",
  "clap",
  "rcgen",
+ "remux-authz",
  "remux-core",
  "remux-gateway",
  "remux-testkit",
@@ -1805,6 +1816,7 @@ dependencies = [
  "futures-util",
  "rcgen",
  "regex",
+ "remux-authz",
  "remux-control-plane",
  "remux-core",
  "remux-testkit",

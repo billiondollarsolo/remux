@@ -23,8 +23,9 @@
 //!   scope-enforcing bearer-auth middleware, and the per-request audit middleware.
 //! - [`ws`] — the WebSocket `/stream` (binary, attachable) and `/events`
 //!   (structured JSON) endpoints.
-//! - [`auth`] — static bearer-token auth with a constant-time compare and a
-//!   coarse read/read-write [`Scope`] split (plan §6.2).
+//! - [`auth`] — bearer-token auth with a constant-time token→[`Principal`]
+//!   resolve and per-route [`Permission`] checks against an RBAC [`Policy`]
+//!   (the shared [`remux_authz`] model; plan §6.2).
 //! - [`tls`] — rustls material (operator PEM or self-signed for loopback).
 //! - [`server`] — serving over TLS via `axum-server`.
 //! - [`api::v1::openapi`] — the generated OpenAPI 3.1 document (T0.5), served at
@@ -50,9 +51,10 @@ pub use api::v1::convert;
 pub use api::v1::dto;
 pub use api::v1::openapi;
 pub use app::{router, AppState};
-pub use auth::{AuthConfig, Scope};
+pub use auth::AuthConfig;
 pub use daemon_conn::{DaemonConn, WaitOutcome, WaitPredicate};
 pub use error::ApiError;
+pub use remux_authz::{Permission, Principal};
 pub use selector::parse_selector;
 pub use server::{bind_listener, serve};
 pub use tls::TlsMaterial;

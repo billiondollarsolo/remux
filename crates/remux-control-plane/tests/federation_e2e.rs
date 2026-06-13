@@ -262,24 +262,25 @@ async fn auth_enforced() {
     let http = client();
     let cp_base = &cp.base_url;
 
-    // Missing admin token -> 401.
+    // Missing admin token -> 401 (unknown/missing credential).
     let resp = http
         .get(format!("{cp_base}/cp/v1/hosts"))
         .send()
         .await
         .expect("hosts no token");
-    assert_eq!(resp.status(), 401, "missing admin token -> 401");
+    assert_eq!(resp.status(), 401, "missing token -> 401");
 
-    // Wrong admin token -> 401.
+    // Wrong/unknown token -> 401.
     let resp = http
         .get(format!("{cp_base}/cp/v1/hosts"))
         .bearer_auth("wrong")
         .send()
         .await
         .expect("hosts wrong token");
-    assert_eq!(resp.status(), 401, "wrong admin token -> 401");
+    assert_eq!(resp.status(), 401, "unknown token -> 401");
 
-    // Using the register token on an admin route -> 401 (wrong group).
+    // The register token resolves to the `registrar` principal, which LACKS
+    // fleet.hosts.read -> known-but-unauthorized -> 403 (distinct from 401).
     let resp = http
         .get(format!("{cp_base}/cp/v1/hosts"))
         .bearer_auth(REGISTER_TOKEN)
@@ -288,11 +289,13 @@ async fn auth_enforced() {
         .expect("hosts register token");
     assert_eq!(
         resp.status(),
-        401,
-        "register token must not satisfy admin routes"
+        403,
+        "registrar principal must be forbidden (403) on the fleet API"
     );
+    let body: serde_json::Value = resp.json().await.expect("403 json");
+    assert_eq!(body["kind"], "forbidden", "403 body: {body}");
 
-    // Register without the register token -> 401.
+    // Register without any token -> 401.
     let resp = http
         .post(format!("{cp_base}/cp/v1/register"))
         .json(&json!({ "name": "x", "url": "https://x:8443", "labels": {}, "token": "t" }))
@@ -301,7 +304,8 @@ async fn auth_enforced() {
         .expect("register no token");
     assert_eq!(resp.status(), 401, "register without token -> 401");
 
-    // Register with the admin token (wrong group) -> 401.
+    // The admin token resolves to `fleet-admin`, which holds ALL CP permissions
+    // including host.register, so it may register (back-compat: a superuser).
     let resp = http
         .post(format!("{cp_base}/cp/v1/register"))
         .bearer_auth(ADMIN_TOKEN)
@@ -309,13 +313,19 @@ async fn auth_enforced() {
         .send()
         .await
         .expect("register admin token");
-    assert_eq!(
-        resp.status(),
-        401,
-        "admin token must not satisfy register routes"
+    assert!(
+        resp.status().is_success(),
+        "fleet-admin (superuser) may register, got {}",
+        resp.status()
     );
+    // Clean up the host the admin just registered.
+    let _ = http
+        .delete(format!("{cp_base}/cp/v1/hosts/x"))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await;
 
-    // Resolve with no matching host -> 404.
+    // Resolve with no matching host -> 404 (admin is authorized; just no host).
     let resp = http
         .post(format!("{cp_base}/cp/v1/resolve"))
         .bearer_auth(ADMIN_TOKEN)
@@ -324,4 +334,51 @@ async fn auth_enforced() {
         .await
         .expect("resolve no host");
     assert_eq!(resp.status(), 404, "resolve with no matching host -> 404");
+}
+
+#[tokio::test]
+async fn fleet_viewer_can_list_but_not_resolve() {
+    use common::start_control_plane_with_auth_config;
+
+    let (cp, viewer_token) = start_control_plane_with_auth_config().await;
+    let http = client();
+    let cp_base = &cp.base_url;
+
+    // The fleet-viewer principal holds fleet.hosts.read -> GET /cp/v1/hosts ok.
+    let resp = http
+        .get(format!("{cp_base}/cp/v1/hosts"))
+        .bearer_auth(&viewer_token)
+        .send()
+        .await
+        .expect("viewer hosts");
+    assert_eq!(resp.status(), 200, "fleet-viewer may list hosts (200)");
+
+    // It also holds fleet.sessions.read -> GET /cp/v1/sessions ok.
+    let resp = http
+        .get(format!("{cp_base}/cp/v1/sessions"))
+        .bearer_auth(&viewer_token)
+        .send()
+        .await
+        .expect("viewer sessions");
+    assert_eq!(
+        resp.status(),
+        200,
+        "fleet-viewer may read federated sessions"
+    );
+
+    // But it LACKS fleet.resolve -> POST /cp/v1/resolve -> 403.
+    let resp = http
+        .post(format!("{cp_base}/cp/v1/resolve"))
+        .bearer_auth(&viewer_token)
+        .json(&json!({ "labels": {"env":"dev"}, "command": ["/bin/sh"] }))
+        .send()
+        .await
+        .expect("viewer resolve");
+    assert_eq!(
+        resp.status(),
+        403,
+        "fleet-viewer must be forbidden on resolve"
+    );
+    let body: serde_json::Value = resp.json().await.expect("403 json");
+    assert_eq!(body["kind"], "forbidden", "403 body: {body}");
 }
