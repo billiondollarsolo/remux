@@ -3,7 +3,7 @@ use std::path::Path;
 use remux_core::framing::{read_message, write_message};
 use remux_core::{
     AttachMode, ClientId, CreateSessionRequest, RemuxError, Request, Response, ScrollbackChunk,
-    SessionDetails, SessionSelector, SessionSummary, TermSize,
+    SessionDetails, SessionSelector, SessionSummary, TermSize, TerminalSnapshot,
 };
 use tokio::net::UnixStream;
 
@@ -53,6 +53,34 @@ impl TestClient {
         let request = Request::CreateSession(CreateSessionRequest {
             name: Some(name.to_string()),
             command: vec!["bash".to_string()],
+            cwd: None,
+            env: vec![("TERM".to_string(), "xterm-256color".to_string())],
+            size: TermSize { cols: 80, rows: 24 },
+        });
+
+        match self.send_request(&request).await? {
+            Response::Created(details) => Ok(details),
+            Response::Error(e) => Err(e),
+            other => Err(RemuxError::ProtocolError(format!(
+                "unexpected response to CreateSession: {other:?}"
+            ))),
+        }
+    }
+
+    /// Create a new session with an explicit command and default settings.
+    ///
+    /// Unlike [`create_session`](Self::create_session) (which always runs
+    /// `bash`), this lets a test pick the program to run, e.g. `["/bin/sh"]`
+    /// for an interactive shell or `["sleep", "30"]` for a long-lived
+    /// no-input process.
+    pub async fn create_session_with_command(
+        &mut self,
+        name: &str,
+        command: &[&str],
+    ) -> Result<SessionDetails, RemuxError> {
+        let request = Request::CreateSession(CreateSessionRequest {
+            name: Some(name.to_string()),
+            command: command.iter().map(|s| s.to_string()).collect(),
             cwd: None,
             env: vec![("TERM".to_string(), "xterm-256color".to_string())],
             size: TermSize { cols: 80, rows: 24 },
@@ -209,6 +237,37 @@ impl TestClient {
             Response::Error(e) => Err(e),
             other => Err(RemuxError::ProtocolError(format!(
                 "unexpected response to RenameSession: {other:?}"
+            ))),
+        }
+    }
+
+    /// Send raw input bytes to a session's PTY (by name).
+    ///
+    /// `SendInput` is fire-and-forget: on success the daemon sends no reply,
+    /// so this method only writes the request and returns without waiting for a
+    /// response. Only the controlling client (or a non-attached client) may
+    /// send input; an attached observer is denied — but since the daemon does
+    /// not reply on success, a permission error surfaces on a *subsequent*
+    /// request rather than here.
+    pub async fn send_input(&mut self, name: &str, data: &[u8]) -> Result<(), RemuxError> {
+        let request = Request::SendInput {
+            session: SessionSelector::Name(name.to_string()),
+            data: data.to_vec(),
+        };
+        write_message(&mut self.stream, &request).await
+    }
+
+    /// Capture the current rendered screen of a session as a snapshot (by name).
+    pub async fn capture_screen(&mut self, name: &str) -> Result<TerminalSnapshot, RemuxError> {
+        let request = Request::CaptureScreen {
+            session: SessionSelector::Name(name.to_string()),
+        };
+
+        match self.send_request(&request).await? {
+            Response::Screen(snapshot) => Ok(snapshot),
+            Response::Error(e) => Err(e),
+            other => Err(RemuxError::ProtocolError(format!(
+                "unexpected response to CaptureScreen: {other:?}"
             ))),
         }
     }

@@ -33,6 +33,9 @@ impl DaemonHarness {
             "REMUX_SOCKET_PATH",
             socket_path.to_string_lossy().to_string(),
         );
+        // Pass the socket path explicitly via the daemon's `--socket` flag so the
+        // daemon binds where the harness expects (the env var alone is advisory).
+        cmd.arg("--socket").arg(&socket_path);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -62,6 +65,9 @@ impl DaemonHarness {
             "REMUX_SOCKET_PATH",
             socket_path.to_string_lossy().to_string(),
         );
+        // Pass the socket path explicitly via the daemon's `--socket` flag so the
+        // daemon binds where the harness expects (the env var alone is advisory).
+        cmd.arg("--socket").arg(&socket_path);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
