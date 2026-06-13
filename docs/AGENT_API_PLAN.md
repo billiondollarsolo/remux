@@ -114,9 +114,9 @@ over an API.** That is the moat.
 | --- | --- | --- | --- | --- | --- |
 | AW0 | API contract & decoupling layer | Versioned public DTOs + protocol↔DTO mapping in `remux-gateway` | runtime (done) | P0 | M |
 | AW1 | SSH transport / `remux bridge` | Human multi-host UX (`--host`, `devbox:backend`) | AW0 (shares DTOs optionally) | P0 | L |
-| AW2 | `remux-gateway` crate (REST control plane) | Sessions CRUD, input, capture-JSON, wait, scrollback over HTTPS | AW0 | P0 | L |
-| AW3 | WebSocket interactive stream (binary framing) | Live terminal I/O + structured screen endpoint | AW2 | P1 | M |
-| AW4 | Auth & TLS posture (v1: bearer + TLS) | Token auth, TLS termination, deny-by-default | AW2 | P0 (ships with AW2) | M |
+| AW2 | `remux-gateway` crate (REST control plane) ✅ **landed** | Sessions CRUD, input, capture-JSON, wait, scrollback over HTTPS | AW0 | P0 | L |
+| AW3 | WebSocket interactive stream (binary framing) ✅ **landed** | Live terminal I/O + structured `/events` channel | AW2 | P1 | M |
+| AW4 | Auth & TLS posture (v1: bearer + TLS) ✅ **landed (v1)** | Token auth, TLS termination, deny-by-default | AW2 | P0 (ships with AW2) | M |
 | AW5 | Browser terminal (xterm.js consumer) | Reference web UI — **listed last, on purpose** | AW3, AW4 | P2 | M |
 | AW6 | Fleet / discovery model | Host registry, cross-host session discovery, intent routing | AW1, AW2 | P2 (design now, build later) | XL |
 
@@ -509,12 +509,28 @@ Returns the scrollback chunk; `Accept: application/octet-stream` for raw bytes,
 
 ### 4.5 Definition of Done
 
-- [ ] `remux-gateway` serves `/v1` sessions CRUD, input, screen, scrollback, wait.
-- [ ] Connects **only** over the local Unix socket; no path reaches the daemon by
-      network.
-- [ ] Every endpoint goes through the DTO layer (snapshot-as-`ScreenView` aside).
-- [ ] Screen endpoint returns structured cells with color/cursor/alt-screen.
-- [ ] OpenAPI doc matches the implemented surface; CI checks drift.
+- [x] `remux-gateway` serves `/v1` sessions CRUD, input, screen, scrollback, wait.
+      **Done** — the axum router in `crates/remux-gateway/src/app.rs` serves
+      `GET/POST /v1/sessions`, `GET/DELETE/PATCH /v1/sessions/{id}`, and the
+      `/input`, `/screen`, `/scrollback`, `/resize`, `/wait` sub-routes. `{id}`
+      resolves UUID-or-name via `selector::parse_selector` (mirrors the CLI).
+- [x] Connects **only** over the local Unix socket; no path reaches the daemon by
+      network. **Done** — every handler opens a per-request `DaemonConn` to the
+      Unix socket; `remuxd` is untouched (still Unix-socket-only).
+- [x] Every endpoint goes through the DTO layer (snapshot-as-`ScreenView` aside).
+      **Done** — handlers return `SessionView`/`ScreenView`/`ScrollbackView`/
+      `WaitResult` via the AW0 `convert` mappings.
+- [x] Screen endpoint returns structured cells with color/cursor/alt-screen.
+      **Done** — `GET /v1/sessions/{id}/screen` returns the `ScreenView`
+      (transparent over `TerminalSnapshot`); the `http_e2e` test reconstructs
+      rows from the JSON cell grid.
+- [ ] OpenAPI doc matches the implemented surface; CI checks drift. — **Still
+      deferred** (no `utoipa` yet); the DTOs remain the source of truth.
+
+**Errors:** a consistent JSON body `{ "error": "...", "kind": "..." }` is
+produced by `ApiErrorResponse` (`IntoResponse`) using `ApiError::http_status()`
+(404/403/504/503/400/502/500). E2E-verified: unknown session → 404, missing/bad
+token → 401.
 
 ---
 
@@ -618,11 +634,29 @@ Map `RemuxError` / exit codes uniformly across HTTP and WS `ERROR` frames:
 
 ### 5.6 Definition of Done
 
-- [ ] `/stream` uses binary frames with the 1-byte tag; OUTPUT bytes are verbatim.
-- [ ] `/events` delivers typed JSON structured events incl. `ScreenView` snapshots.
-- [ ] No base64 anywhere on the I/O hot path; non-UTF-8 output verified intact.
-- [ ] Observer/Control modes both reachable; control rules enforced at the gateway.
-- [ ] Lag triggers a snapshot resync rather than corruption.
+- [x] `/stream` uses **binary** frames; OUTPUT (PTY) bytes are forwarded
+      **verbatim**. **Done** (`crates/remux-gateway/src/ws.rs`). v1 simplification:
+      server→client output and client→server input are raw binary frames (no
+      1-byte tag); the type tag is reserved for a later iteration. Control vs raw
+      input is distinguished by **frame type** instead: a **text** frame carrying
+      `{"type":"resize","cols":N,"rows":N}` is the resize control message, raw
+      input is a **binary** frame. `/stream` Control-attaches to the daemon so
+      input and resize are accepted (`DaemonConn::subscribe_control`).
+- [x] `/events` delivers typed JSON structured events. **Done** — `exited`,
+      `updated`, `terminating`, `control_lost`, `snapshot` (the `ScreenView`), and
+      `error`, from an Observer subscription. WSS-e2e-verified (`exited`).
+- [x] No base64 anywhere on the I/O hot path; OUTPUT bytes are sent as binary
+      frames untouched (non-UTF-8 safe by construction). **Done.**
+- [x] Observer/Control modes both reachable; control rules enforced at the
+      gateway/daemon. **Done** — `/stream` = Control, `/events` = Observer.
+- [ ] Lag triggers a snapshot resync rather than corruption. — **Deferred** (the
+      backpressure/resync policy is a later iteration; v1 forwards output frames
+      directly).
+
+**Auth on WS:** the upgrade is gated by the same bearer middleware, which accepts
+the token via the `Authorization` header **or** `?token=<token>` (browsers can't
+set headers on a WS handshake). The `ws_e2e` test connects over `wss://` with the
+token in the query string.
 
 ---
 
@@ -678,11 +712,23 @@ scopes become RBAC permissions.
 
 ### 6.5 Definition of Done
 
-- [ ] TLS-terminating gateway; HTTP refused except explicit loopback dev.
-- [ ] Static bearer tokens with read / read+write scopes; deny-by-default.
-- [ ] Daemon still Unix-socket-only; no code path adds a daemon network listener.
-- [ ] Audit logging of every API call (hashed token id).
-- [ ] OIDC/JWT/mTLS/RBAC documented as deferred to AW6.
+- [x] TLS-terminating gateway; **TLS is always on** (rustls via `axum-server`).
+      **Done** (`crates/remux-gateway/src/tls.rs`, `src/server.rs`). Operator
+      PEM via `--tls-cert`/`--tls-key`, else a self-signed cert is generated for
+      `127.0.0.1`/`localhost` at startup (fingerprint logged). There is no
+      plaintext listener. (No `--insecure` path was added; HTTP is simply not
+      served.)
+- [x] Static bearer token; deny-by-default. **Done** (`src/auth.rs`,
+      `src/app.rs::auth_layer`). Every `/v1/*` route except `GET /v1/health`
+      requires `Authorization: Bearer <token>` (WS also accepts `?token=`), with a
+      **constant-time** compare. Missing/wrong → `401` JSON. **Note:** v1 ships a
+      single token (read+write); the read-vs-write **scope split is deferred** to
+      a follow-up (the token is principal-shaped for that upgrade).
+- [x] Daemon still Unix-socket-only; no code path adds a daemon network listener.
+      **Done** — only `remux-gateway` was touched; `remuxd` is unchanged.
+- [x] Audit logging seed: the startup logs a non-reversible `token_id` hash (never
+      the raw token); per-request structured audit lines are a follow-up.
+- [x] OIDC/JWT/mTLS/RBAC + per-token scopes documented as deferred to AW6.
 
 ---
 

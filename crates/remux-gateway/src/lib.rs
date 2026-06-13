@@ -18,14 +18,35 @@
 //! - [`ApiError`] — a public error type with an HTTP-status mapping (`u16`),
 //!   pre-defining the taxonomy AW2's axum server will reuse.
 //!
-//! What is deliberately **not** here: the HTTP/WS server (axum) and OpenAPI
-//! generation. Those are AW2 — see the plan. This crate adds no web dependency.
+//! AW2/AW3/AW4 build on this foundation, all in this crate:
+//! - [`app`] — the axum router, REST `/v1` handlers, the JSON error wrapper, and
+//!   the bearer-auth middleware.
+//! - [`ws`] — the WebSocket `/stream` (binary, attachable) and `/events`
+//!   (structured JSON) endpoints.
+//! - [`auth`] — static bearer-token auth with a constant-time compare.
+//! - [`tls`] — rustls material (operator PEM or self-signed for loopback).
+//! - [`server`] — serving over TLS via `axum-server`.
+//!
+//! The `remux-gateway` binary (`src/main.rs`) ties these together: a
+//! TLS-terminating, bearer-authed HTTPS/WSS server bound to `127.0.0.1` by
+//! default, translating the public `/v1` contract onto the local daemon socket.
 
 pub mod api;
+pub mod app;
+pub mod auth;
 pub mod daemon_conn;
 pub mod error;
+pub mod selector;
+pub mod server;
+pub mod tls;
+pub mod ws;
 
 pub use api::v1::convert;
 pub use api::v1::dto;
-pub use daemon_conn::{DaemonConn, WaitPredicate};
+pub use app::{router, AppState};
+pub use auth::AuthConfig;
+pub use daemon_conn::{DaemonConn, WaitOutcome, WaitPredicate};
 pub use error::ApiError;
+pub use selector::parse_selector;
+pub use server::{bind_listener, serve};
+pub use tls::TlsMaterial;

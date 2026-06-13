@@ -19,8 +19,9 @@ use std::time::Duration;
 use regex::Regex;
 use remux_core::framing::{read_message, write_message};
 use remux_core::{
-    AttachMode, ClientId, CreateSessionRequest, Event, Request, Response, ScrollbackChunk,
-    SessionDetails, SessionSelector, SessionSummary, TermSize, TerminalSnapshot, PROTOCOL_VERSION,
+    AttachBootstrap, AttachMode, ClientId, CreateSessionRequest, Event, RemuxError, Request,
+    Response, ScrollbackChunk, SessionDetails, SessionSelector, SessionSummary, TermSize,
+    TerminalSnapshot, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::net::UnixStream;
@@ -286,23 +287,60 @@ impl DaemonConn {
     /// owns the socket for the lifetime of the stream (exactly as the CLI's
     /// `wait`/`attach` split the client).
     pub async fn subscribe(
-        mut self,
+        self,
         session: SessionSelector,
     ) -> Result<(ObserverStream, SubscribeHandle), ApiError> {
         let size = TermSize { cols: 80, rows: 24 };
+        let (stream, handle, _bootstrap) = self.attach(session, size, AttachMode::Observer).await?;
+        Ok((stream, handle))
+    }
+
+    /// Attach as a **Control** client and consume the resulting event stream.
+    ///
+    /// This is the load-bearing primitive for the WebSocket `/stream` endpoint:
+    /// unlike [`Self::subscribe`] (read-only Observer), a Control attach makes
+    /// this connection the controlling client, so input forwarded via the
+    /// returned [`SubscribeHandle::send_input`] and resizes via
+    /// [`SubscribeHandle::resize`] are accepted by the daemon (they carry the
+    /// same `client_id` that holds control).
+    ///
+    /// Returns the [`ObserverStream`], the [`SubscribeHandle`] (write/control
+    /// side), and the [`AttachBootstrap`] so the caller can repaint the screen
+    /// faithfully on connect.
+    pub async fn subscribe_control(
+        self,
+        session: SessionSelector,
+        size: TermSize,
+    ) -> Result<(ObserverStream, SubscribeHandle, AttachBootstrap), ApiError> {
+        self.attach(session, size, AttachMode::Control).await
+    }
+
+    /// Shared attach implementation for Observer/Control subscriptions.
+    async fn attach(
+        mut self,
+        session: SessionSelector,
+        size: TermSize,
+        mode: AttachMode,
+    ) -> Result<(ObserverStream, SubscribeHandle, AttachBootstrap), ApiError> {
         let client_id = ClientId::new();
         let resp = self
             .request(Request::AttachSession {
                 session: session.clone(),
                 size,
-                mode: AttachMode::Observer,
+                mode: mode.clone(),
                 client_id: client_id.clone(),
             })
             .await?;
-        match resp {
-            Response::Attached(_) => {}
-            other => return Err(unexpected("AttachSession{Observer}", &other)),
-        }
+        let bootstrap = match resp {
+            Response::Attached(b) => b,
+            other => {
+                let what = match mode {
+                    AttachMode::Control => "AttachSession{Control}",
+                    AttachMode::Observer => "AttachSession{Observer}",
+                };
+                return Err(unexpected(what, &other));
+            }
+        };
 
         let line_buf = self.line_buf;
         let (read_half, write_half) = tokio::io::split(self.stream);
@@ -315,7 +353,7 @@ impl DaemonConn {
             session,
             client_id,
         };
-        Ok((stream, handle))
+        Ok((stream, handle, bootstrap))
     }
 
     /// Wait on semantic state, composed from the observer stream + a predicate.
@@ -365,10 +403,25 @@ pub struct ObserverStream {
 
 impl ObserverStream {
     /// Read the next event, or `Ok(None)` if the daemon closed the connection.
+    ///
+    /// On a **Control** attach the same connection also carries the `Response::Ok`
+    /// reply to a `ResizeSession` request issued over the control side. That frame
+    /// is not an [`Event`]; it is silently skipped here (bounded) so the resize
+    /// control path does not corrupt the event stream.
     pub async fn next_event(&mut self) -> Result<Option<Event>, ApiError> {
-        read_message::<Event>(&mut self.reader, &mut self.event_line)
-            .await
-            .map_err(ApiError::from)
+        // Bound the skip so a genuinely broken stream cannot spin forever.
+        for _ in 0..64 {
+            match read_message::<Event>(&mut self.reader, &mut self.event_line).await {
+                Ok(Some(ev)) => return Ok(Some(ev)),
+                Ok(None) => return Ok(None),
+                // A non-Event frame (e.g. a `Response::Ok` resize ack) — skip it.
+                Err(RemuxError::ProtocolError(_)) => continue,
+                Err(e) => return Err(ApiError::from(e)),
+            }
+        }
+        Err(ApiError::Protocol(
+            "too many non-event frames on the observer stream".to_string(),
+        ))
     }
 }
 
@@ -386,6 +439,42 @@ impl SubscribeHandle {
             &mut self.writer,
             &Request::DetachSession {
                 session: self.session.clone(),
+                client_id: self.client_id.clone(),
+            },
+        )
+        .await
+        .map_err(ApiError::from)
+    }
+
+    /// Forward raw input bytes to the session over this (control) connection.
+    ///
+    /// Fire-and-forget, matching the daemon's `SendInput` (no reply). Sent on the
+    /// same connection that holds control, so a Control attach's input is accepted.
+    pub async fn send_input(&mut self, data: Vec<u8>) -> Result<(), ApiError> {
+        write_message(
+            &mut self.writer,
+            &Request::SendInput {
+                session: self.session.clone(),
+                data,
+            },
+        )
+        .await
+        .map_err(ApiError::from)
+    }
+
+    /// Resize the session's PTY over this (control) connection.
+    ///
+    /// Fire-and-forget over the control connection; the daemon would reply `Ok`,
+    /// but on a control-attached connection the reply interleaves with the event
+    /// stream, so the read side ([`ObserverStream`]) is where any reply lands.
+    /// For the `/stream` use case the resize is advisory and we do not block on a
+    /// reply.
+    pub async fn resize(&mut self, size: TermSize) -> Result<(), ApiError> {
+        write_message(
+            &mut self.writer,
+            &Request::ResizeSession {
+                session: self.session.clone(),
+                size,
                 client_id: self.client_id.clone(),
             },
         )
