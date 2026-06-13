@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>remux — web terminal</title>
+    <!--
+      xterm.js is loaded from a CDN (jsdelivr) for this v1 client. This keeps the
+      gateway dependency-free (no JS bundler / Node toolchain). FOLLOW-UP:
+      vendoring xterm.js into the gateway binary for fully offline / air-gapped
+      use is a deliberate follow-up, not done here.
+    -->
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css"
+    />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header id="topbar">
+      <span class="brand">remux</span>
+      <input
+        id="token"
+        type="password"
+        placeholder="bearer token"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <button id="connect">connect</button>
+      <span id="status" class="status">disconnected</span>
+    </header>
+    <main id="layout">
+      <aside id="sidebar">
+        <div class="sidebar-head">sessions</div>
+        <ul id="sessions"></ul>
+      </aside>
+      <section id="terminal-pane">
+        <div id="terminal"></div>
+      </section>
+    </main>
+
+    <!--
+      xterm.js + the fit addon, from a CDN. Vendoring for offline use is a
+      follow-up (see the comment in <head>).
+    -->
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

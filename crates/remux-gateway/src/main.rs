@@ -52,6 +52,12 @@ struct Cli {
     /// TLS private key (PEM). Must be paired with `--tls-cert`.
     #[arg(long)]
     tls_key: Option<PathBuf>,
+
+    /// Disable the built-in browser client (AW5). When set, `GET /` (and the
+    /// static asset routes) return `404`; the `/v1` API is unaffected. The UI is
+    /// served by default.
+    #[arg(long)]
+    no_web_ui: bool,
 }
 
 fn resolve_socket_path(flag: Option<PathBuf>) -> PathBuf {
@@ -157,7 +163,13 @@ async fn run(cli: Cli) -> Result<(), String> {
         tracing::info!("read-only token configured (observe-only scope)");
     }
 
-    let state = AppState::new(socket_path, auth);
+    if cli.no_web_ui {
+        tracing::info!("built-in browser client disabled (--no-web-ui); GET / returns 404");
+    } else {
+        tracing::info!(url = %format!("https://{addr}/"), "built-in browser client served at GET /");
+    }
+
+    let state = AppState::new(socket_path, auth).with_web_ui(!cli.no_web_ui);
 
     remux_gateway::server::serve(listener, rustls_config, state)
         .await

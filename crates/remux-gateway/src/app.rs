@@ -40,6 +40,10 @@ pub struct AppState {
     pub socket_path: Arc<PathBuf>,
     /// Bearer-token auth configuration.
     pub auth: AuthConfig,
+    /// Whether the built-in browser client (AW5) is served. When `false`,
+    /// `GET /`, `/app.js`, and `/style.css` return `404`. Defaults to `true`;
+    /// disabled via `--no-web-ui`.
+    pub web_ui_enabled: bool,
 }
 
 impl AppState {
@@ -47,7 +51,14 @@ impl AppState {
         Self {
             socket_path: Arc::new(socket_path),
             auth,
+            web_ui_enabled: true,
         }
+    }
+
+    /// Set whether the built-in browser client is served (default `true`).
+    pub fn with_web_ui(mut self, enabled: bool) -> Self {
+        self.web_ui_enabled = enabled;
+        self
     }
 
     /// Open a fresh daemon connection (with handshake).
@@ -145,10 +156,19 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/openapi.json", get(openapi_json));
 
+    // AW5: the built-in browser client (xterm.js), served OUTSIDE the `/v1`
+    // auth group — the static HTML/JS/CSS carry no secrets; the user supplies a
+    // token in-page. Returns 404 when `--no-web-ui` disabled it.
+    let web_routes = Router::new()
+        .route("/", get(crate::web::index))
+        .route("/app.js", get(crate::web::app_js))
+        .route("/style.css", get(crate::web::style_css));
+
     Router::new()
         .nest("/v1", public.merge(read_routes).merge(write_routes))
         // Audit every /v1 request (after routing, so the matched path is known).
         .layer(middleware::from_fn(audit_layer))
+        .merge(web_routes)
         .with_state(state)
 }
 

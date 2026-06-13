@@ -117,7 +117,7 @@ over an API.** That is the moat.
 | AW2 | `remux-gateway` crate (REST control plane) ✅ **landed** | Sessions CRUD, input, capture-JSON, wait, scrollback over HTTPS | AW0 | P0 | L |
 | AW3 | WebSocket interactive stream (binary framing) ✅ **landed** | Live terminal I/O + structured `/events` channel | AW2 | P1 | M |
 | AW4 | Auth & TLS posture (v1: bearer + TLS) ✅ **landed (v1)** | Token auth, TLS termination, deny-by-default | AW2 | P0 (ships with AW2) | M |
-| AW5 | Browser terminal (xterm.js consumer) | Reference web UI — **listed last, on purpose** | AW3, AW4 | P2 | M |
+| AW5 | Browser terminal (xterm.js consumer) ✅ **shipped (minimal built-in client)** | Reference web UI served by the gateway — **listed last, on purpose** | AW3, AW4 | P2 | M |
 | AW6 | Fleet / discovery model | **v1 client-side discovery: done** (host registry + `fleet ls`/`hosts`/`attach` fan-out over SSH); **control plane: deferred** (federation, RBAC, intent routing, migration) | AW1, AW2 | P2 (v1 shipped; control plane later) | XL |
 
 **Critical path:** AW0 → AW2 + AW4 (the structured API, secured) is the
@@ -762,6 +762,22 @@ scopes become RBAC permissions.
 
 ## 7. AW5 — Browser Terminal (xterm.js) — *Listed Last, On Purpose*
 
+> **Status update:** AW5 has **shipped** as a deliberately minimal, self-contained
+> client **served by the gateway binary itself** — no separate Node/Next.js build,
+> no JS toolchain. The static assets (`crates/remux-gateway/web/{index.html,app.js,
+> style.css}`) are embedded with `include_str!` (zero new deps) and served on
+> routes **outside** the `/v1` bearer-auth group (`GET /`, `/app.js`, `/style.css`);
+> the user supplies the token in-page (or via `?token=`). It lists sessions from
+> `GET /v1/sessions` and attaches one session at a time over the binary `/stream`
+> WebSocket (output bytes → `term.write(Uint8Array)`; input → binary frames;
+> resize → a `{"type":"resize",…}` **text** frame), using xterm.js + the fit addon
+> from a CDN. `--no-web-ui` disables it (`GET /` → `404`). The "rich web app /
+> collab / recording" surface below stays **out of scope** — this is the thin
+> reference consumer, on purpose. Tests: `crates/remux-gateway/tests/web_ui_e2e.rs`
+> (asserts the gateway serves the assets with correct status/content-type/markers
+> and that `--no-web-ui` 404s; in-browser rendering is not automatable here).
+> Follow-up: vendoring xterm.js for offline/air-gapped use.
+
 **Goal:** A reference web UI that consumes the API. It is intentionally the
 **last** consumer, because it is table stakes (§0.1) and exists to *demonstrate*
 the API, not to *be* the product.
@@ -789,9 +805,17 @@ the API, not to *be* the product.
 
 ### 7.3 Definition of Done
 
-- [ ] xterm.js SPA attaches via binary WS, renders OUTPUT bytes verbatim.
-- [ ] Session list + live status come from `/v1` + `/events`, no scraping.
-- [ ] No feature creep into collab/recording; it stays a reference consumer.
+- [x] xterm.js client attaches via binary WS, renders OUTPUT bytes verbatim.
+      **Done** — `web/app.js` writes binary frames as `term.write(new
+      Uint8Array(buf))` (non-UTF-8 safe), sends input as binary frames, and resize
+      as a `{"type":"resize",…}` text frame; served by the gateway over TLS.
+- [x] Session list comes from `/v1/sessions`; one session at a time (v1).
+      **Done** — a sidebar fetches `GET /v1/sessions` with the in-page bearer token
+      and reconnects the `/stream` socket on selection. (Live `/events` status
+      badges are a possible later polish; not needed for the table-stakes client.)
+- [x] No feature creep into collab/recording; it stays a reference consumer.
+      **Done** — single-session, no recording/collab; served by the gateway with a
+      `--no-web-ui` off switch.
 
 ---
 
@@ -972,7 +996,9 @@ The agent-native API + fleet differentiator is "delivered (v1)" when:
 - [x] v1 auth = TLS + static bearer with read/read-write scopes, deny-by-default,
       per-request audit logging; daemon local-only (AW4). OIDC/mTLS/fine-grained
       RBAC remain deferred to AW6.
-- [ ] A reference xterm.js consumer exists and is **not** the headline (AW5).
+- [x] A reference xterm.js consumer exists and is **not** the headline (AW5) —
+      a minimal built-in client served by the gateway (`--no-web-ui` to disable);
+      rich web app / collab / recording remain out of scope.
 - [ ] The fleet model is designed and earlier layers are forward-compatible with
       it (AW6).
 - [ ] An end-to-end test drives `create → send → wait → peek-json → branch on

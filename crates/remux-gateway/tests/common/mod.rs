@@ -88,8 +88,24 @@ pub async fn start_gateway_with_scopes(socket_path: PathBuf) -> GatewayHandle {
     start_gateway_with_auth(socket_path, auth).await
 }
 
-/// Start the gateway with an explicit [`AuthConfig`].
+/// Start the gateway with the built-in browser client (AW5) **disabled**
+/// (`--no-web-ui` equivalent), with the fixed read-write [`TEST_TOKEN`].
+pub async fn start_gateway_no_web_ui(socket_path: PathBuf) -> GatewayHandle {
+    let auth = AuthConfig::new(TEST_TOKEN.to_string());
+    start_gateway_with_auth_and_web(socket_path, auth, false).await
+}
+
+/// Start the gateway with an explicit [`AuthConfig`] (web UI enabled).
 pub async fn start_gateway_with_auth(socket_path: PathBuf, auth: AuthConfig) -> GatewayHandle {
+    start_gateway_with_auth_and_web(socket_path, auth, true).await
+}
+
+/// Start the gateway with an explicit [`AuthConfig`] and an explicit web-UI flag.
+pub async fn start_gateway_with_auth_and_web(
+    socket_path: PathBuf,
+    auth: AuthConfig,
+    web_ui: bool,
+) -> GatewayHandle {
     ensure_crypto_provider();
 
     let tls = TlsMaterial::generate_self_signed().expect("generate self-signed cert");
@@ -99,7 +115,7 @@ pub async fn start_gateway_with_auth(socket_path: PathBuf, auth: AuthConfig) -> 
     let (listener, addr) = remux_gateway::server::bind_listener("127.0.0.1:0".parse().unwrap())
         .expect("bind ephemeral loopback port");
 
-    let state = AppState::new(socket_path, auth);
+    let state = AppState::new(socket_path, auth).with_web_ui(web_ui);
 
     tokio::spawn(async move {
         let _ = remux_gateway::server::serve(listener, rustls_config, state).await;

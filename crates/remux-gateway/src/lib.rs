@@ -42,6 +42,7 @@ pub mod error;
 pub mod selector;
 pub mod server;
 pub mod tls;
+pub mod web;
 pub mod ws;
 
 pub use api::v1::convert;

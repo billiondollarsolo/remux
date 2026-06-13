@@ -332,6 +332,20 @@ WS clients pass the token via `?token=…` (browser-friendly) or the
 IPC protocol, so the wire can evolve under `PROTOCOL_VERSION` without breaking
 `/v1`; see `docs/openapi.yaml` and `docs/AGENT_API_PLAN.md`.
 
+### Browser client
+
+Visiting `https://<host>:8443/` serves a **built-in xterm.js terminal** — a
+minimal reference client baked into the gateway binary (no separate web build).
+Paste a bearer token into the field (or open `…/?token=<token>` to prefill it),
+pick a session from the sidebar, and the page attaches over the binary
+`/stream` WebSocket. It is a deliberately thin consumer of `/v1`; it does not do
+collaboration, recording, or multi-session layouts.
+
+- `--no-web-ui` disables it (then `GET /` returns `404`); the `/v1` API is
+  unaffected.
+- xterm.js loads from a CDN (jsdelivr); vendoring it for fully offline /
+  air-gapped use is a follow-up.
+
 ## Configuration
 
 Config is loaded from `~/.config/remux/config.toml` (or the path given to
