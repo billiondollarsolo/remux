@@ -17,10 +17,10 @@ pub struct VtState {
 }
 
 impl VtState {
-    pub fn new(size: RemuxTermSize) -> Self {
+    pub fn new(size: RemuxTermSize, scrollback_lines: usize) -> Self {
         let term_size = AlaTermSize::new(size.cols as usize, size.rows as usize);
         let config = TermConfig {
-            scrolling_history: 10000,
+            scrolling_history: scrollback_lines,
             ..Default::default()
         };
         let term = Term::new(config, &term_size, VoidListener);
@@ -35,7 +35,6 @@ impl VtState {
     }
 
     /// Resize the virtual terminal to the given dimensions.
-    #[allow(dead_code)]
     pub fn resize(&mut self, size: RemuxTermSize) {
         let term_size = AlaTermSize::new(size.cols as usize, size.rows as usize);
         self.term.resize(term_size);

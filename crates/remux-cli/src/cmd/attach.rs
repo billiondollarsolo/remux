@@ -51,7 +51,8 @@ pub async fn run(mut client: RemuxClient, name: String) -> Result<(), RemuxError
     }
     let _guard = RawModeGuard;
 
-    // Write any scrollback data to stdout.
+    // Write any scrollback data to stdout (history first), then repaint the
+    // current screen from the VT snapshot on top of it.
     if !bootstrap.scrollback.is_empty() {
         let stdout = std::io::stdout();
         let mut handle = stdout.lock();
@@ -61,6 +62,13 @@ pub async fn run(mut client: RemuxClient, name: String) -> Result<(), RemuxError
         handle
             .flush()
             .map_err(|e| RemuxError::IoError(format!("flush error: {e}")))?;
+    }
+
+    // Repaint the visible screen from the parsed VT snapshot so TUIs (vim,
+    // htop, less) and colors come back faithfully on reattach.
+    if let Some(ref snapshot) = bootstrap.vt_snapshot {
+        let painted = crate::render_snapshot::paint_snapshot(snapshot);
+        write_to_stdout(&painted)?;
     }
 
     // Split the UnixStream for concurrent reading and writing.
@@ -154,7 +162,11 @@ pub async fn run(mut client: RemuxClient, name: String) -> Result<(), RemuxError
                             Event::ControlLost { session: _ } => {
                                 let _ = write_to_stdout(b"\r\n[session control taken by another client]\r\n");
                             }
-                            Event::StateSnapshot { .. } | Event::SessionUpdated(_) => {}
+                            Event::StateSnapshot { snapshot, .. } => {
+                                let painted = crate::render_snapshot::paint_snapshot(&snapshot);
+                                let _ = write_to_stdout(&painted);
+                            }
+                            Event::SessionUpdated(_) => {}
                         }
                     }
                     Ok(None) => {

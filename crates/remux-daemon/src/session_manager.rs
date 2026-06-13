@@ -181,7 +181,7 @@ impl SessionManager {
             pty_writer: Some(pty_process.writer),
             pty_child: Some(pty_process.child),
             master_pty: Some(pty_process.master_pty),
-            vt: Some(VtState::new(size)),
+            vt: Some(VtState::new(size, self.config.daemon.max_scrollback_lines)),
             scrollback,
             partial_line: Vec::new(),
             subscribers: Vec::new(),
@@ -359,6 +359,11 @@ impl SessionManager {
                         "failed to resize pty on attach"
                     );
                 }
+            }
+            // Also resize the VT so the snapshot grid matches the client's
+            // terminal dimensions (otherwise reattach paints a stale size).
+            if let Some(ref mut vt) = session.vt {
+                vt.resize(size);
             }
         }
 

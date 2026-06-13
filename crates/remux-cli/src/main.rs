@@ -3,6 +3,7 @@ mod cmd;
 mod daemon_spawn;
 mod raw_mode;
 mod render;
+mod render_snapshot;
 
 use std::path::PathBuf;
 use std::process;
