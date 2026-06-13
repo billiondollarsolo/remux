@@ -4,9 +4,9 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize as AlaTermSize;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color, Processor};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
 
-use remux_core::terminal::{CellData, TerminalSnapshot};
+use remux_core::terminal::{CellColor, CellData, TerminalSnapshot};
 use remux_core::TermSize as RemuxTermSize;
 
 /// Wrapper around alacritty_terminal's Term that processes PTY output
@@ -57,12 +57,15 @@ impl VtState {
                 let column = Column(col);
                 let cell = &grid[line][column];
                 let cell_data = CellData {
-                    char: if cell.c == '\0' { ' ' } else { cell.c },
-                    fg: color_to_option(cell.fg),
-                    bg: color_to_option(cell.bg),
+                    ch: if cell.c == '\0' { ' ' } else { cell.c },
+                    fg: convert_color(cell.fg),
+                    bg: convert_color(cell.bg),
                     bold: cell.flags.contains(Flags::BOLD),
+                    dim: cell.flags.contains(Flags::DIM),
                     italic: cell.flags.contains(Flags::ITALIC),
                     underline: cell.flags.contains(Flags::UNDERLINE),
+                    reverse: cell.flags.contains(Flags::INVERSE),
+                    strikethrough: cell.flags.contains(Flags::STRIKEOUT),
                 };
                 cells.push(cell_data);
             }
@@ -87,10 +90,28 @@ impl VtState {
     }
 }
 
-fn color_to_option(color: Color) -> Option<u8> {
+fn convert_color(color: Color) -> CellColor {
     match color {
-        Color::Named(_) => None,
-        Color::Spec(_rgb) => None,
-        Color::Indexed(idx) => Some(idx),
+        Color::Spec(rgb) => CellColor::Rgb(rgb.r, rgb.g, rgb.b),
+        Color::Indexed(idx) => CellColor::Indexed(idx),
+        Color::Named(named) => match named {
+            NamedColor::Black => CellColor::Indexed(0),
+            NamedColor::Red => CellColor::Indexed(1),
+            NamedColor::Green => CellColor::Indexed(2),
+            NamedColor::Yellow => CellColor::Indexed(3),
+            NamedColor::Blue => CellColor::Indexed(4),
+            NamedColor::Magenta => CellColor::Indexed(5),
+            NamedColor::Cyan => CellColor::Indexed(6),
+            NamedColor::White => CellColor::Indexed(7),
+            NamedColor::BrightBlack => CellColor::Indexed(8),
+            NamedColor::BrightRed => CellColor::Indexed(9),
+            NamedColor::BrightGreen => CellColor::Indexed(10),
+            NamedColor::BrightYellow => CellColor::Indexed(11),
+            NamedColor::BrightBlue => CellColor::Indexed(12),
+            NamedColor::BrightMagenta => CellColor::Indexed(13),
+            NamedColor::BrightCyan => CellColor::Indexed(14),
+            NamedColor::BrightWhite => CellColor::Indexed(15),
+            _ => CellColor::Default,
+        },
     }
 }

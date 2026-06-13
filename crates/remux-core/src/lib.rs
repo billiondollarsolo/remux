@@ -9,7 +9,7 @@ pub use config::Config;
 pub use error::RemuxError;
 pub use protocol::{
     AttachBootstrap, AttachMode, ClientId, CreateSessionRequest, Event, Request, Response,
-    ScrollbackChunk, SessionDetails, SessionSelector, SessionSummary,
+    ScrollbackChunk, SessionDetails, SessionSelector, SessionSummary, PROTOCOL_VERSION,
 };
 pub use session::{SessionId, SessionStatus, TermSize};
-pub use terminal::{CellData, TerminalSnapshot};
+pub use terminal::{CellColor, CellData, TerminalSnapshot};

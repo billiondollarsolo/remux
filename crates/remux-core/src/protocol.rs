@@ -4,6 +4,11 @@ use crate::error::RemuxError;
 use crate::session::{SessionId, SessionStatus, TermSize};
 use crate::terminal::TerminalSnapshot;
 
+/// Wire protocol version. Bumped on any breaking change to the serialized
+/// request/response/event/snapshot types. Defined here so future breaks can be
+/// detected via a handshake instead of silently corrupting state.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// Unique identifier for a connected client.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ClientId(pub uuid::Uuid);
@@ -169,7 +174,7 @@ pub enum Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::CellData;
+    use crate::terminal::{CellColor, CellData};
 
     fn sample_term_size() -> TermSize {
         TermSize { cols: 80, rows: 24 }
@@ -298,12 +303,15 @@ mod tests {
             cols: 80,
             rows: 24,
             cells: vec![CellData {
-                char: 'A',
-                fg: Some(1),
-                bg: None,
+                ch: 'A',
+                fg: CellColor::Indexed(1),
+                bg: CellColor::Default,
                 bold: false,
+                dim: false,
                 italic: false,
                 underline: false,
+                reverse: false,
+                strikethrough: false,
             }],
             cursor_row: 0,
             cursor_col: 0,
@@ -462,20 +470,26 @@ mod tests {
             rows: 40,
             cells: vec![
                 CellData {
-                    char: 'X',
-                    fg: Some(2),
-                    bg: Some(0),
+                    ch: 'X',
+                    fg: CellColor::Indexed(2),
+                    bg: CellColor::Indexed(0),
                     bold: true,
+                    dim: false,
                     italic: false,
                     underline: false,
+                    reverse: false,
+                    strikethrough: false,
                 },
                 CellData {
-                    char: 'Y',
-                    fg: None,
-                    bg: None,
+                    ch: 'Y',
+                    fg: CellColor::Default,
+                    bg: CellColor::Default,
                     bold: false,
+                    dim: false,
                     italic: true,
                     underline: true,
+                    reverse: false,
+                    strikethrough: false,
                 },
             ],
             cursor_row: 5,
