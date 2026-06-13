@@ -151,6 +151,114 @@ async fn create_list_kill_roundtrip() {
 }
 
 #[tokio::test]
+async fn scrollback_survives_daemon_restart() {
+    // Option A persistence: a session's metadata + scrollback are persisted; on
+    // a fresh daemon started against the same data dir the session reappears as
+    // `Exited` and its scrollback is readable via `logs`/ReadScrollback. The
+    // live process is gone (its PTY died with the old daemon) — we never recover
+    // a running process.
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let name = "persist-me";
+    let marker = "REMUX_PERSIST_MARKER";
+
+    // --- First daemon: create a session, produce known output, then exit it.
+    {
+        let mut harness =
+            DaemonHarness::start_with_binary_and_data_dir(&locate_remuxd(), data_dir.path(), true)
+                .await
+                .expect("failed to start first daemon");
+        let mut client = harness.connect().await.expect("connect");
+
+        client
+            .create_session_with_command(name, &["/bin/sh"])
+            .await
+            .expect("create_session failed");
+
+        // Let the shell reach its read loop, then make it print the marker on a
+        // line of its own (scrollback commits lines on newline).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client
+            .send_input(name, format!("echo {marker}\n").as_bytes())
+            .await
+            .expect("send_input failed");
+
+        // Wait until the marker is actually in scrollback before we exit it,
+        // so the flush-on-exit captures it.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut in_scrollback = false;
+        while Instant::now() < deadline {
+            if let Ok(chunk) = client.read_scrollback(name, 1000).await {
+                if String::from_utf8_lossy(&chunk.data).contains(marker) {
+                    in_scrollback = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(75)).await;
+        }
+        assert!(
+            in_scrollback,
+            "marker never reached scrollback before restart"
+        );
+
+        // Make the shell exit on its own (clean PTY EOF). This runs the graceful
+        // exit path (`mark_exited`), which synchronously flushes scrollback to
+        // disk. We avoid `kill_session` here because an interactive `/bin/sh`
+        // ignores the default SIGTERM. Then poll until Exited is observed so the
+        // flush has completed.
+        client
+            .send_input(name, b"exit\n")
+            .await
+            .expect("send exit failed");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            if let Ok(d) = client.inspect_session(name).await {
+                if d.status == SessionStatus::Exited {
+                    exited = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(exited, "session did not reach Exited before restart");
+
+        harness.stop().await.expect("stop first daemon");
+    }
+
+    // --- Second daemon on the SAME data dir: recovery.
+    {
+        let harness =
+            DaemonHarness::start_with_binary_and_data_dir(&locate_remuxd(), data_dir.path(), true)
+                .await
+                .expect("failed to start second daemon");
+        let mut client = harness.connect().await.expect("connect after restart");
+
+        // The recovered session is present and marked Exited (process is gone).
+        let details = client
+            .inspect_session(name)
+            .await
+            .expect("recovered session should be inspectable after restart");
+        assert_eq!(details.name, name);
+        assert_eq!(
+            details.status,
+            SessionStatus::Exited,
+            "recovered session must be Exited (no live process across restart)"
+        );
+
+        // Its scrollback is readable and contains the marker we wrote earlier.
+        let chunk = client
+            .read_scrollback(name, 1000)
+            .await
+            .expect("read_scrollback after restart failed");
+        let text = String::from_utf8_lossy(&chunk.data);
+        assert!(
+            text.contains(marker),
+            "recovered scrollback missing marker {marker:?}; got: {text:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn send_and_capture() {
     let harness = start_harness().await;
 

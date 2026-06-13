@@ -23,10 +23,76 @@ impl DaemonHarness {
     ///
     /// Waits up to 5 seconds for the socket to become available.
     pub async fn start() -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = tempfile::tempdir()?;
-        let socket_path = temp_dir.path().join("remux.sock");
-
         let daemon_bin = Self::find_daemon_binary()?;
+        Self::start_with_binary(&daemon_bin).await
+    }
+
+    /// Start a daemon using an explicit binary path.
+    pub async fn start_with_binary(daemon_bin: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        Self::start_inner(daemon_bin, temp_dir, None, false).await
+    }
+
+    /// Start a daemon with persistence enabled and an explicit, reusable data
+    /// directory, so a subsequent daemon started on the same `data_dir` recovers
+    /// the sessions and scrollback the first one persisted.
+    ///
+    /// The returned harness owns a fresh temp dir for its socket and config, but
+    /// the daemon's `data.dir` is pointed at the caller-provided `data_dir`. Pass
+    /// the same `data_dir` to two successive `start_with_data_dir` calls (with a
+    /// `stop()` in between) to exercise restart recovery.
+    pub async fn start_with_data_dir(
+        data_dir: &Path,
+        persist_scrollback: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let daemon_bin = Self::find_daemon_binary()?;
+        Self::start_with_binary_and_data_dir(&daemon_bin, data_dir, persist_scrollback).await
+    }
+
+    /// Like [`Self::start_with_data_dir`] but with an explicit binary path (for
+    /// tests that locate `remuxd` themselves rather than relying on the
+    /// cwd-relative search).
+    pub async fn start_with_binary_and_data_dir(
+        daemon_bin: &Path,
+        data_dir: &Path,
+        persist_scrollback: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        Self::start_inner(
+            daemon_bin,
+            temp_dir,
+            Some(data_dir.to_path_buf()),
+            persist_scrollback,
+        )
+        .await
+    }
+
+    /// Internal: spawn the daemon with an isolated data dir written into a
+    /// generated config file (passed via `-c`). Always isolates `data.dir` so
+    /// test runs never touch the real `~/.local/share/remux` and so startup
+    /// session recovery cannot pull in unrelated state.
+    async fn start_inner(
+        daemon_bin: &Path,
+        temp_dir: tempfile::TempDir,
+        data_dir: Option<PathBuf>,
+        persist_scrollback: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let socket_path = temp_dir.path().join("remux.sock");
+        // Default the data dir to this harness's own temp dir so each daemon is
+        // fully isolated unless the caller asked to share one (restart tests).
+        let data_dir = data_dir.unwrap_or_else(|| temp_dir.path().join("data"));
+        std::fs::create_dir_all(&data_dir)?;
+
+        // Write a minimal config pinning the data dir (and persistence). Written
+        // as a literal TOML string to avoid pulling a toml serializer into the
+        // testkit. Paths are emitted via debug formatting, which quotes/escapes.
+        let config_path = temp_dir.path().join("config.toml");
+        let config_toml = format!(
+            "[data]\ndir = {data:?}\n\n[daemon]\npersist_scrollback = {persist}\n",
+            data = data_dir,
+            persist = persist_scrollback,
+        );
+        std::fs::write(&config_path, config_toml)?;
 
         let mut cmd = tokio::process::Command::new(daemon_bin);
         cmd.env(
@@ -36,6 +102,7 @@ impl DaemonHarness {
         // Pass the socket path explicitly via the daemon's `--socket` flag so the
         // daemon binds where the harness expects (the env var alone is advisory).
         cmd.arg("--socket").arg(&socket_path);
+        cmd.arg("--config").arg(&config_path);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -50,37 +117,6 @@ impl DaemonHarness {
         };
 
         // Wait for socket to appear
-        harness.wait_for_socket(Duration::from_secs(5)).await?;
-
-        Ok(harness)
-    }
-
-    /// Start a daemon using an explicit binary path.
-    pub async fn start_with_binary(daemon_bin: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = tempfile::tempdir()?;
-        let socket_path = temp_dir.path().join("remux.sock");
-
-        let mut cmd = tokio::process::Command::new(daemon_bin);
-        cmd.env(
-            "REMUX_SOCKET_PATH",
-            socket_path.to_string_lossy().to_string(),
-        );
-        // Pass the socket path explicitly via the daemon's `--socket` flag so the
-        // daemon binds where the harness expects (the env var alone is advisory).
-        cmd.arg("--socket").arg(&socket_path);
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let child = cmd
-            .spawn()
-            .map_err(|e| RemuxError::Internal(format!("failed to spawn remuxd: {e}")))?;
-
-        let mut harness = Self {
-            daemon_process: Some(child),
-            socket_path,
-            temp_dir,
-        };
-
         harness.wait_for_socket(Duration::from_secs(5)).await?;
 
         Ok(harness)

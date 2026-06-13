@@ -4,7 +4,8 @@
 > to change — the protocol, CLI interface, config format, and internal APIs are
 > all still evolving. Not ready for production use.
 
-A terminal session runtime — persist, detach, and reattach shell sessions.
+A terminal session runtime — detach and reattach shell sessions, with
+crash-resilient scrollback that survives a daemon restart.
 
 Remux is a tmux alternative built in Rust. A background daemon (`remuxd`) owns PTY
 processes and exposes session management over a Unix domain socket. The CLI
@@ -99,6 +100,27 @@ remux logs api
 remux logs api --lines 100
 ```
 
+### Persistence
+
+Remux persists **session metadata and scrollback history**, not live processes.
+When `remuxd` exits, the PTYs it owns die with it (they are its children), so a
+daemon restart cannot resurrect a running program. What it *can* do:
+
+- **Metadata** for every session is written to
+  `~/.local/share/remux/sessions/<id>.json` on create/rename.
+- **Scrollback** is written to `<id>.scrollback` when
+  `persist_scrollback = true` — flushed on session exit and periodically
+  (every ~10s) for crash-resilience.
+
+On startup the daemon recovers prior sessions and presents them as **`Exited`**
+(the process is gone). You can still `ls`, `inspect`, and read their history with
+`remux logs`; attaching to a recovered session is rejected because there is no
+live process. Recovered sessions can be cleared with `remux kill`, and old
+persisted sessions are pruned automatically per `cleanup_exited_after_hours`
+(set to `0` to disable cleanup).
+
+There is no live-process recovery across restarts.
+
 ### TUI
 
 ```sh
@@ -127,8 +149,8 @@ Config is loaded from `~/.config/remux/config.toml` (or the path given to
 [daemon]
 socket_path = "/run/user/1000/remux/remuxd.sock"   # default: dirs::state_dir()/remux/remuxd.sock
 max_scrollback_lines = 20000
-persist_scrollback = false
-cleanup_exited_after_hours = 168                    # 7 days
+persist_scrollback = false                          # write scrollback to disk so it survives a daemon restart
+cleanup_exited_after_hours = 168                    # prune persisted sessions older than this; 7 days (0 = never)
 
 [client]
 default_shell = "/bin/bash"                         # default: $SHELL or /bin/sh
@@ -144,7 +166,7 @@ dir = "/home/user/.local/share/remux"               # default: dirs::data_dir()/
 |------|---------|---------|
 | Config | `~/.config/remux/config.toml` | Daemon and client settings |
 | Socket | `~/.local/state/remux/remuxd.sock` | IPC Unix domain socket |
-| Sessions | `~/.local/share/remux/sessions/` | Persisted session metadata |
+| Sessions | `~/.local/share/remux/sessions/` | Persisted session metadata + scrollback |
 
 ## IPC Protocol
 

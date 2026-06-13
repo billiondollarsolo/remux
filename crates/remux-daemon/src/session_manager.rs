@@ -658,6 +658,19 @@ impl SessionManager {
 
     /// Mark a session as exited.
     pub fn mark_exited(&mut self, session_id: &SessionId, exit_code: Option<i32>) {
+        let persist = self.config.daemon.persist_scrollback;
+        // On the graceful/normal exit path, flush this session's scrollback to
+        // disk (when enabled) so it survives a daemon restart and is available
+        // via `logs`/`ReadScrollback` for the recovered Exited session.
+        if persist {
+            if let Some(session) = self.sessions.get(session_id) {
+                let lines = session.scrollback.read_all();
+                if let Err(e) = persistence::save_scrollback(&self.config, session_id, &lines) {
+                    tracing::warn!(session_id = %session_id.0, error = %e, "failed to flush scrollback on exit");
+                }
+            }
+        }
+
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.status = SessionStatus::Exited;
             session.last_exit_code = exit_code;
@@ -674,7 +687,250 @@ impl SessionManager {
             );
         }
     }
+
+    /// Flush every live session's scrollback to disk for crash-resilience.
+    ///
+    /// Called periodically by a background task when `persist_scrollback` is
+    /// enabled. The manager lock is held for the duration, but the work is just
+    /// cloning each session's line buffer and writing it — bounded by
+    /// `max_scrollback_lines` per session — so the hold is short. Only sessions
+    /// that are still running are flushed here; exited sessions were already
+    /// flushed by `mark_exited`.
+    pub fn flush_all_scrollback(&self) {
+        if !self.config.daemon.persist_scrollback {
+            return;
+        }
+        for session in self.sessions.values() {
+            if session.status == SessionStatus::Exited {
+                continue;
+            }
+            let lines = session.scrollback.read_all();
+            if let Err(e) = persistence::save_scrollback(&self.config, &session.id, &lines) {
+                tracing::warn!(session_id = %session.id.0, error = %e, "failed to flush scrollback");
+            }
+        }
+    }
+
+    /// Whether scrollback persistence is enabled in the daemon config.
+    pub fn persist_scrollback_enabled(&self) -> bool {
+        self.config.daemon.persist_scrollback
+    }
+
+    /// Recover prior sessions from disk on daemon startup (Option A).
+    ///
+    /// For each persisted session, reconstruct a **read-only** `SessionHandle`
+    /// marked `Exited` with no PTY handles and no live VT. Scrollback is
+    /// repopulated from the on-disk `.scrollback` file (when present) so
+    /// `list`, `inspect`, and `logs`/`ReadScrollback` work after a restart.
+    /// The underlying process is gone (its PTY died with the old daemon), so we
+    /// never attempt to respawn it — recovery restores history and metadata
+    /// only.
+    ///
+    /// Name collisions: if two persisted entries share a name, the first wins
+    /// and the later one is skipped (it remains on disk but is not indexed). A
+    /// recovered name can later collide with a new `create_session`, which
+    /// already errors on duplicate names; that is acceptable and never panics.
+    pub fn load_persisted(&mut self) {
+        let persisted = persistence::load_sessions(&self.config);
+        let mut recovered = 0usize;
+
+        for meta in persisted {
+            if self.sessions.contains_key(&meta.id) || self.name_index.contains_key(&meta.name) {
+                tracing::warn!(
+                    session_id = %meta.id.0,
+                    name = %meta.name,
+                    "skipping recovered session with id/name collision"
+                );
+                continue;
+            }
+
+            let mut scrollback = ScrollbackBuffer::new(self.config.daemon.max_scrollback_lines);
+            if self.config.daemon.persist_scrollback {
+                for line in persistence::load_scrollback(&self.config, &meta.id) {
+                    scrollback.push(line);
+                }
+            }
+
+            let handle = SessionHandle {
+                id: meta.id.clone(),
+                name: meta.name.clone(),
+                command: meta.command,
+                cwd: meta.cwd,
+                // Clearly mark as ended-by-daemon-restart: Exited, no live state.
+                status: SessionStatus::Exited,
+                created_at: meta.created_at,
+                updated_at: meta.created_at,
+                last_exit_code: None,
+                last_size: TermSize { cols: 80, rows: 24 },
+                controlling_client: None,
+                attached_clients: Vec::new(),
+                pid: None,
+                pty_reader: None,
+                pty_writer: None,
+                pty_child: None,
+                master_pty: None,
+                vt: None,
+                scrollback,
+                partial_line: Vec::new(),
+                subscribers: Vec::new(),
+                pump_handle: None,
+            };
+
+            self.name_index.insert(meta.name, meta.id.clone());
+            self.sessions.insert(meta.id, handle);
+            recovered += 1;
+        }
+
+        if recovered > 0 {
+            tracing::info!(recovered, "recovered persisted sessions as Exited");
+        }
+    }
 }
 
 /// Shared session manager type used throughout the daemon.
 pub type SharedSessionManager = Arc<Mutex<SessionManager>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remux_core::config::{DaemonConfig, DataConfig};
+
+    fn config_with_dir(dir: &std::path::Path, persist: bool) -> Config {
+        Config {
+            data: DataConfig {
+                dir: dir.to_path_buf(),
+            },
+            daemon: DaemonConfig {
+                persist_scrollback: persist,
+                ..DaemonConfig::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    /// Simulates a daemon restart at the `SessionManager` level: a prior daemon
+    /// persisted metadata + scrollback to disk; a fresh manager recovers them.
+    ///
+    /// This is the component-level stand-in for the end-to-end restart test
+    /// (see the note in the WS4 implementation): it exercises the exact
+    /// recovery path (`load_persisted`) that the daemon runs on startup,
+    /// asserting Option A semantics — recovered session is `Exited`, its
+    /// scrollback is readable via `read_scrollback`, and it is reachable by
+    /// name and id.
+    #[test]
+    fn load_persisted_recovers_exited_session_with_scrollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_dir(dir.path(), true);
+
+        // A prior daemon would have written these.
+        let id = SessionId::new();
+        persistence::save_session(
+            &config,
+            &persistence::PersistedSession {
+                id: id.clone(),
+                name: "recovered".to_string(),
+                command: vec!["bash".to_string()],
+                cwd: PathBuf::from("/tmp"),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+        persistence::save_scrollback(
+            &config,
+            &id,
+            &[b"hello world".to_vec(), b"second line".to_vec()],
+        )
+        .unwrap();
+
+        // Fresh manager (as on daemon startup) recovers from disk.
+        let mut mgr = SessionManager::new(config);
+        mgr.load_persisted();
+
+        // Reachable by id and by name (name_index populated).
+        let by_name = mgr
+            .inspect_session(&SessionSelector::Name("recovered".to_string()))
+            .expect("recovered session reachable by name");
+        assert_eq!(by_name.id, id);
+        // Marked Exited with no live process.
+        assert_eq!(by_name.status, SessionStatus::Exited);
+        assert_eq!(by_name.pid, None);
+        assert_eq!(by_name.last_exit_code, None);
+
+        // Appears in `list`.
+        assert_eq!(mgr.list_sessions().len(), 1);
+
+        // Scrollback restored and readable via `logs`/ReadScrollback.
+        let chunk = mgr
+            .read_scrollback(&SessionSelector::Id(id.clone()), 100)
+            .unwrap();
+        assert_eq!(chunk.lines, 2);
+        assert_eq!(chunk.data, b"hello world\nsecond line\n");
+    }
+
+    /// With `persist_scrollback = false`, metadata is still recovered but no
+    /// scrollback is loaded back.
+    #[test]
+    fn load_persisted_without_scrollback_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_dir(dir.path(), false);
+
+        let id = SessionId::new();
+        persistence::save_session(
+            &config,
+            &persistence::PersistedSession {
+                id: id.clone(),
+                name: "meta-only".to_string(),
+                command: vec!["zsh".to_string()],
+                cwd: PathBuf::from("/tmp"),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+        // Even if a scrollback file exists on disk, it must not be loaded when
+        // persistence is disabled.
+        persistence::save_scrollback(&config, &id, &[b"ignored".to_vec()]).unwrap();
+
+        let mut mgr = SessionManager::new(config);
+        mgr.load_persisted();
+
+        let details = mgr
+            .inspect_session(&SessionSelector::Id(id.clone()))
+            .expect("metadata recovered");
+        assert_eq!(details.status, SessionStatus::Exited);
+
+        let chunk = mgr.read_scrollback(&SessionSelector::Id(id), 100).unwrap();
+        assert_eq!(chunk.lines, 0);
+        assert!(chunk.data.is_empty());
+    }
+
+    /// Recovered sessions must not block; a duplicate persisted name is skipped
+    /// (first wins) rather than panicking.
+    #[test]
+    fn load_persisted_skips_name_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_dir(dir.path(), false);
+
+        for _ in 0..2 {
+            persistence::save_session(
+                &config,
+                &persistence::PersistedSession {
+                    id: SessionId::new(),
+                    name: "dup".to_string(),
+                    command: vec!["bash".to_string()],
+                    cwd: PathBuf::from("/tmp"),
+                    created_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        }
+
+        let mut mgr = SessionManager::new(config);
+        mgr.load_persisted();
+
+        // Both files share a name; exactly one is indexed/recovered.
+        assert_eq!(mgr.list_sessions().len(), 1);
+        assert!(mgr
+            .inspect_session(&SessionSelector::Name("dup".to_string()))
+            .is_ok());
+    }
+}

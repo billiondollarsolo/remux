@@ -11,7 +11,11 @@ use remux_core::{
     ClientId, Config, Event, RemuxError, Request, Response, SessionId, SessionSelector,
 };
 
+use crate::persistence;
 use crate::session_manager::{SessionManager, SharedSessionManager};
+
+/// Interval between periodic scrollback flushes for crash-resilience.
+const SCROLLBACK_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The main daemon, owning the session registry and socket server.
 pub struct Daemon {
@@ -20,7 +24,16 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn new(config: Config) -> Self {
-        let sessions = Arc::new(Mutex::new(SessionManager::new(config)));
+        // Startup recovery (Option A): prune stale persisted sessions, then
+        // reconstruct prior sessions from disk as read-only `Exited` handles so
+        // their metadata and scrollback survive a daemon restart. The PTYs are
+        // gone with the old daemon; we never respawn processes.
+        persistence::cleanup_old_sessions(&config);
+
+        let mut manager = SessionManager::new(config);
+        manager.load_persisted();
+
+        let sessions = Arc::new(Mutex::new(manager));
         Self { sessions }
     }
 
@@ -60,6 +73,25 @@ impl Daemon {
         tracing::info!(socket = %socket_path.display(), "remuxd listening");
 
         let sessions = self.sessions.clone();
+
+        // Periodic scrollback flush for crash-resilience. Only spawned when
+        // `persist_scrollback` is enabled; on a hard daemon crash this bounds
+        // scrollback loss to roughly one flush interval. Normal/graceful exits
+        // are already flushed synchronously in `mark_exited`.
+        let persist_enabled = { sessions.lock().await.persist_scrollback_enabled() };
+        if persist_enabled {
+            let flush_sessions = sessions.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(SCROLLBACK_FLUSH_INTERVAL);
+                // Skip the immediate first tick; nothing to flush at startup.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let mgr = flush_sessions.lock().await;
+                    mgr.flush_all_scrollback();
+                }
+            });
+        }
 
         // Accept connections in a loop
         loop {
