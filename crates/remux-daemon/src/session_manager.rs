@@ -14,7 +14,7 @@ use remux_core::{
 use crate::persistence;
 use crate::pty;
 use crate::scrollback::ScrollbackBuffer;
-use crate::vt::VtState;
+use crate::vt::{self, TerminalEngine};
 
 /// Handle to a live session, owned by the daemon.
 pub struct SessionHandle {
@@ -42,8 +42,9 @@ pub struct SessionHandle {
 
     /// Portable master PTY handle for resize.
     pub master_pty: Option<Box<dyn portable_pty::MasterPty + Send + 'static>>,
-    /// Virtual terminal state (alacritty_terminal).
-    pub vt: Option<VtState>,
+    /// Virtual terminal state, held behind the [`TerminalEngine`] seam so the
+    /// backing emulator can be swapped in one place (see `vt::new_engine`).
+    pub vt: Option<Box<dyn TerminalEngine + Send>>,
 
     /// Scrollback ring buffer.
     pub scrollback: ScrollbackBuffer,
@@ -586,7 +587,10 @@ impl SessionManager {
             pty_writer: Some(pty_process.writer),
             pty_child: Some(pty_process.child),
             master_pty: Some(pty_process.master_pty),
-            vt: Some(VtState::new(size, self.config.daemon.max_scrollback_lines)),
+            vt: Some(vt::new_engine(
+                size,
+                self.config.daemon.max_scrollback_lines,
+            )),
             scrollback,
             partial_line: Vec::new(),
             subscribers: Vec::new(),
@@ -990,7 +994,7 @@ mod tests {
                     pty_writer: None,
                     pty_child: None,
                     master_pty: None,
-                    vt: Some(VtState::new(TermSize { cols: 80, rows: 24 }, 1000)),
+                    vt: Some(vt::new_engine(TermSize { cols: 80, rows: 24 }, 1000)),
                     scrollback: ScrollbackBuffer::new(1000),
                     partial_line: Vec::new(),
                     subscribers: Vec::new(),

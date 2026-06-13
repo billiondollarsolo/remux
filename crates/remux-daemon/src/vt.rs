@@ -52,6 +52,32 @@ impl EventListener for ResponseCapture {
     }
 }
 
+/// The VT-engine seam. Swap implementations here to change terminal
+/// emulators (alacritty_terminal today; wezterm-term / libghostty are the
+/// candidate alternatives if a fidelity gap appears).
+///
+/// This trait captures exactly the surface the daemon needs from a terminal
+/// emulator. The daemon holds engines as `Box<dyn TerminalEngine + Send>` and
+/// constructs them via [`new_engine`], so changing the backing emulator is a
+/// one-line change in [`new_engine`] rather than a daemon-wide edit.
+pub trait TerminalEngine: Send {
+    /// Feed raw PTY output bytes into the terminal state.
+    fn process(&mut self, data: &[u8]);
+    /// Build a [`TerminalSnapshot`] from the current terminal state.
+    fn snapshot(&self) -> TerminalSnapshot;
+    /// Resize the virtual terminal to the given dimensions.
+    fn resize(&mut self, size: RemuxTermSize);
+    /// Drain any bytes the terminal generated in response to queries.
+    fn take_responses(&mut self) -> Vec<u8>;
+}
+
+/// Construct the VT engine the daemon uses. THIS is the swap point: to change
+/// terminal emulators (e.g. to `wezterm-term` or libghostty), return a
+/// different boxed [`TerminalEngine`] implementation here.
+pub fn new_engine(size: RemuxTermSize, scrollback_lines: usize) -> Box<dyn TerminalEngine + Send> {
+    Box::new(VtState::new(size, scrollback_lines))
+}
+
 /// Wrapper around alacritty_terminal's Term that processes PTY output
 /// and can produce terminal snapshots for reattach.
 pub struct VtState {
@@ -147,6 +173,24 @@ impl VtState {
     }
 }
 
+impl TerminalEngine for VtState {
+    fn process(&mut self, data: &[u8]) {
+        VtState::process(self, data)
+    }
+
+    fn snapshot(&self) -> TerminalSnapshot {
+        VtState::snapshot(self)
+    }
+
+    fn resize(&mut self, size: RemuxTermSize) {
+        VtState::resize(self, size)
+    }
+
+    fn take_responses(&mut self) -> Vec<u8> {
+        VtState::take_responses(self)
+    }
+}
+
 fn convert_color(color: Color) -> CellColor {
     match color {
         Color::Spec(rgb) => CellColor::Rgb(rgb.r, rgb.g, rgb.b),
@@ -226,5 +270,19 @@ mod tests {
         let mut vt = small_vt();
         vt.process(b"hello world\r\n");
         assert!(vt.take_responses().is_empty());
+    }
+
+    #[test]
+    fn boxed_engine_answers_queries_through_the_trait() {
+        // Exercise the engine through the boxed trait object built by the
+        // factory swap point, proving the seam works end to end.
+        let mut engine: Box<dyn TerminalEngine + Send> =
+            new_engine(RemuxTermSize { cols: 80, rows: 24 }, 100);
+        // CSI c -> Primary Device Attributes request.
+        engine.process(b"\x1b[c");
+        assert!(
+            !engine.take_responses().is_empty(),
+            "boxed engine should answer the DA query through the trait"
+        );
     }
 }
