@@ -4,9 +4,8 @@
 > work taking `remux` from "working prototype" to "robust, daily-usable terminal
 > multiplexer" on par with — and beyond — [`coder/boo`](https://github.com/coder/boo).
 >
-> All seven workstreams have landed on `master`. The only intentionally deferred
-> item is **WS5 / T5.2** (the global-lock → per-session-lock refactor), which is a
-> performance optimization, not a correctness fix — see the marker in §7.
+> All seven workstreams have landed on `master`, including the formerly deferred
+> **WS5 / T5.2** (the global-lock → per-session-lock refactor) — see §7.
 > Resolved product decisions (see §11): detach uses a **`Ctrl-a` prefix**
 > (default, configurable); the TUI is exposed as **`remux ui`** (the `remux-tui`
 > binary remains); boo-style **command aliases** are shipped.
@@ -619,24 +618,36 @@ the eager broadcast; rely on the pump's authoritative `SessionExited` with the
 true code. If clients need instant feedback, send a distinct
 `Event::SessionTerminating` instead of a fake exit.
 
-#### T5.2 — Per-session locking (F11) — **DEFERRED**
+#### T5.2 — Per-session locking (F11) — **DONE**
 
-> **Deferred (performance, not correctness):** This is a contention/throughput
-> optimization with no behavioral or wire-format impact, so it is intentionally
-> deferred rather than risk a large lock refactor; the global `Mutex` is left
-> as-is and all WS5 correctness items land independently.
+> **Done:** The registry now stores per-session handles behind their own locks
+> (`sessions: HashMap<SessionId, Arc<tokio::sync::Mutex<SessionHandle>>>`). The
+> outer `Mutex<SessionManager>` still guards the map + `name_index`, but lookups
+> hold it only long enough to clone the `Arc<Mutex<SessionHandle>>`; the PTY
+> output pump clones its handle ONCE at startup and thereafter locks only that
+> handle per chunk — never the registry — so independent sessions no longer
+> contend. Lock ordering is strictly `registry -> handle`, never two handles at
+> once, and the hot path never takes the registry lock while holding a handle,
+> so there is no lock-order inversion.
 
-The single `Mutex<SessionManager>` (`daemon.rs:17`) is locked on **every** PTY
-output chunk (`daemon.rs:374-384`) and the whole map is iterated on every client
-disconnect (`daemon.rs:170-187`). Refactor toward:
-- An outer `RwLock`/`DashMap` over the session registry (lookup/insert/remove).
-- Each `SessionHandle` behind its own `Mutex` (or split the hot path: keep
-  subscribers + scrollback in a per-session structure the pump can lock alone).
-- The PTY pump then locks only its own session, not the global manager.
+The single `Mutex<SessionManager>` (`daemon.rs:17`) was locked on **every** PTY
+output chunk and the whole map was iterated on every client disconnect (the
+latter already fixed by T5.3). Implemented as:
+- Outer `Mutex` over the registry (`sessions` map + `name_index`) for
+  lookup/insert/remove only.
+- Each `SessionHandle` behind its own `Arc<Mutex<..>>`; all per-session work
+  (`append_to_scrollback`, `broadcast_event`, `attach`/`detach`/`resize`/
+  `send_input`/`capture_screen`/`kill`/`mark_exited`) is a method on the handle.
+- The PTY pump receives its handle clone from `create_session` and locks only
+  that handle on the hot path; the registry is touched only on the exit path
+  (for `Config`-driven scrollback persistence), never while holding the handle.
 
-This is an internal refactor with no protocol change; gate it on the WS0
-integration tests staying green. Benchmark with N=100 idle sessions producing
-output to confirm reduced contention (optional `criterion` bench).
+Internal refactor only — no protocol/CLI/event change. Covered by the existing
+WS0 integration tests (which start a real daemon and exercise concurrency) plus
+a new daemon unit test (`per_session_locking_concurrent_output_no_deadlock`)
+that drives output + broadcast across several sessions concurrently, each task
+holding only its own handle lock, asserting no deadlock and per-session output
+integrity.
 
 #### T5.3 — Track per-client attachments
 
@@ -672,7 +683,7 @@ loses output → corrupted screen. Decide policy: either (a) coalesce to a
 ### 7.3 Definition of Done
 
 - [ ] No duplicate/fake `SessionExited`.
-- [ ] ~~PTY pump no longer contends on a global lock for steady-state output.~~ (T5.2 deferred — perf, not correctness)
+- [x] PTY pump no longer contends on a global lock for steady-state output (T5.2 — per-session locking).
 - [ ] Disconnect cleanup is O(attached sessions).
 - [ ] Protocol version handshake in place.
 - [ ] Documented, tested backpressure/resync policy.

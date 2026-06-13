@@ -58,6 +58,13 @@ pub struct SessionHandle {
     pub pump_handle: Option<JoinHandle<()>>,
 }
 
+/// A per-session handle behind its own lock.
+///
+/// The PTY output hot path clones this `Arc` once (out of the registry) and
+/// thereafter locks ONLY this handle per output chunk — never the registry — so
+/// independent sessions never contend on a single global mutex.
+pub type SharedSessionHandle = Arc<Mutex<SessionHandle>>;
+
 impl SessionHandle {
     /// Build a SessionSummary from this handle.
     pub fn to_summary(&self) -> SessionSummary {
@@ -90,12 +97,395 @@ impl SessionHandle {
             pid: self.pid,
         }
     }
+
+    /// Take the PTY master reader out of this handle (for the PTY pump task).
+    pub fn take_pty_reader(&mut self) -> Option<Box<dyn std::io::Read + Send + 'static>> {
+        self.pty_reader.take()
+    }
+
+    /// Attach a client to this session. Returns bootstrap data and an event
+    /// receiver. Operates purely on `self`; the caller holds only this handle's
+    /// lock (never the registry lock).
+    pub fn attach(
+        &mut self,
+        size: TermSize,
+        mode: AttachMode,
+        client_id: ClientId,
+    ) -> Result<(AttachBootstrap, mpsc::Receiver<Event>), RemuxError> {
+        if self.status == SessionStatus::Exited {
+            return Err(RemuxError::SessionExited(self.last_exit_code));
+        }
+
+        if mode == AttachMode::Control {
+            if let Some(ref ctrl) = self.controlling_client {
+                if *ctrl == client_id {
+                    return Err(RemuxError::AlreadyAttached(self.name.clone()));
+                }
+                // Notify the old controlling client that control was taken
+                let old_client_id = ctrl.clone();
+                let control_lost_event = Event::ControlLost {
+                    session: self.id.clone(),
+                };
+                self.subscribers
+                    .retain(|tx| match tx.try_send(control_lost_event.clone()) {
+                        Ok(()) => true,
+                        Err(mpsc::error::TrySendError::Full(_)) => true,
+                        Err(mpsc::error::TrySendError::Closed(_)) => false,
+                    });
+                tracing::info!(
+                    session_id = %self.id.0,
+                    old_client = ?old_client_id,
+                    new_client = ?client_id,
+                    "stealing control from old client"
+                );
+            }
+            self.controlling_client = Some(client_id.clone());
+        }
+
+        if !self.attached_clients.contains(&client_id) {
+            self.attached_clients.push(client_id.clone());
+        }
+
+        let (tx, rx) = mpsc::channel(256);
+        self.subscribers.push(tx);
+
+        // Resize PTY if this is the controlling client
+        if mode == AttachMode::Control {
+            self.last_size = size;
+            if let Some(ref master) = self.master_pty {
+                if let Err(e) = pty::resize_pty_master(master.as_ref(), size) {
+                    tracing::warn!(
+                        session_id = %self.id.0,
+                        error = %e,
+                        "failed to resize pty on attach"
+                    );
+                }
+            }
+            // Also resize the VT so the snapshot grid matches the client's
+            // terminal dimensions (otherwise reattach paints a stale size).
+            if let Some(ref mut vt) = self.vt {
+                vt.resize(size);
+            }
+        }
+
+        self.updated_at = chrono::Utc::now();
+
+        let scrollback_bytes = self.scrollback.read_all_bytes();
+        let details = self.to_details();
+        let vt_snapshot = self.vt.as_ref().map(|vt| vt.snapshot());
+
+        let bootstrap = AttachBootstrap {
+            session: details,
+            scrollback: scrollback_bytes,
+            vt_snapshot,
+        };
+
+        tracing::info!(
+            session_id = %self.id.0,
+            client_id = ?client_id,
+            mode = ?mode,
+            "client attached to session"
+        );
+
+        Ok((bootstrap, rx))
+    }
+
+    /// Detach a client from this session.
+    pub fn detach(&mut self, client_id: &ClientId) -> Result<(), RemuxError> {
+        let was_attached = self.attached_clients.iter().any(|c| c == client_id);
+        if !was_attached {
+            return Err(RemuxError::NotAttached);
+        }
+
+        self.attached_clients.retain(|c| c != client_id);
+
+        if self.controlling_client.as_ref() == Some(client_id) {
+            self.controlling_client = None;
+        }
+
+        self.subscribers.retain(|tx| !tx.is_closed());
+        self.updated_at = chrono::Utc::now();
+
+        tracing::info!(
+            session_id = %self.id.0,
+            client_id = ?client_id,
+            "client detached from session"
+        );
+
+        Ok(())
+    }
+
+    /// Resize this session's PTY (controlling client only).
+    pub fn resize(&mut self, size: TermSize, client_id: &ClientId) -> Result<(), RemuxError> {
+        if self.controlling_client.as_ref() != Some(client_id) {
+            return Err(RemuxError::PermissionDenied);
+        }
+
+        if let Some(ref master) = self.master_pty {
+            pty::resize_pty_master(master.as_ref(), size)?;
+        }
+
+        // Also resize the VT state if present
+        if let Some(ref mut vt) = self.vt {
+            vt.resize(size);
+        }
+
+        self.last_size = size;
+        self.updated_at = chrono::Utc::now();
+
+        tracing::debug!(
+            session_id = %self.id.0,
+            cols = size.cols,
+            rows = size.rows,
+            "resized session"
+        );
+        Ok(())
+    }
+
+    /// Send input data to this session's PTY.
+    ///
+    /// Permission rule: input is allowed when the client is the controlling
+    /// client, OR when the client is not attached at all (a pure headless
+    /// injector, e.g. `remux send`). Input is denied only when the client IS
+    /// attached but is not the controller — i.e. an observer. This preserves
+    /// the observer read-only guarantee while enabling headless injection.
+    pub fn send_input(&mut self, data: &[u8], client_id: &ClientId) -> Result<(), RemuxError> {
+        let is_controller = self.controlling_client.as_ref() == Some(client_id);
+        let is_attached = self.attached_clients.iter().any(|c| c == client_id);
+        // Deny only attached observers (attached but not controlling).
+        if !is_controller && is_attached {
+            return Err(RemuxError::PermissionDenied);
+        }
+
+        if self.status == SessionStatus::Exited {
+            return Err(RemuxError::SessionExited(self.last_exit_code));
+        }
+
+        if let Some(ref mut writer) = self.pty_writer {
+            use std::io::Write;
+            writer
+                .write_all(data)
+                .map_err(|e| RemuxError::PtyError(format!("failed to write to pty: {e}")))?;
+            writer
+                .flush()
+                .map_err(|e| RemuxError::PtyError(format!("failed to flush pty: {e}")))?;
+        } else {
+            return Err(RemuxError::SessionExited(None));
+        }
+
+        Ok(())
+    }
+
+    /// Read scrollback from this session.
+    pub fn read_scrollback(&self, lines: usize) -> ScrollbackChunk {
+        let line_data = self.scrollback.read_last(lines);
+        let mut data = Vec::new();
+        for line in &line_data {
+            data.extend_from_slice(line);
+            data.push(b'\n');
+        }
+
+        ScrollbackChunk {
+            data,
+            lines: line_data.len(),
+        }
+    }
+
+    /// Capture the current screen of this session as a `TerminalSnapshot`.
+    pub fn capture_screen(&self) -> Result<TerminalSnapshot, RemuxError> {
+        self.vt.as_ref().map(|vt| vt.snapshot()).ok_or_else(|| {
+            RemuxError::InvalidRequest(format!(
+                "session {} has no terminal state to capture",
+                self.name
+            ))
+        })
+    }
+
+    /// Send a signal to this session's process group.
+    pub fn kill(&self, signal: Option<i32>) -> Result<(), RemuxError> {
+        let sig = signal.unwrap_or(nix::sys::signal::Signal::SIGTERM as i32);
+        let raw_pid = match self.pid {
+            Some(pid) => pid,
+            None => return Ok(()), // session already exited, nothing to kill
+        };
+        let pid = nix::unistd::Pid::from_raw(raw_pid as i32);
+        let pgid = nix::unistd::getpgid(Some(pid))
+            .map_err(|e| RemuxError::PtyError(format!("failed to get pgid: {e}")))?;
+        let nix_signal = nix::sys::signal::Signal::try_from(sig)
+            .map_err(|e| RemuxError::InvalidRequest(format!("invalid signal: {e}")))?;
+        nix::sys::signal::kill(pgid, nix_signal)
+            .map_err(|e| RemuxError::PtyError(format!("failed to kill: {e}")))?;
+
+        tracing::info!(session_id = %self.id.0, signal = ?signal, "killed session");
+        Ok(())
+    }
+
+    /// Append raw bytes to this session's scrollback buffer and update VT state.
+    ///
+    /// After feeding the bytes through the VT, drain any responses the terminal
+    /// generated (replies to Device Attributes / cursor-position / device-status
+    /// queries). Detached terminal-query answering: if NO client is currently
+    /// attached, the daemon writes those replies back to the PTY itself so a
+    /// backgrounded TUI that queried the terminal doesn't hang waiting for an
+    /// answer. If a client IS attached, the responses are discarded — the
+    /// client's real terminal answers the queries, and writing them here too
+    /// would double-answer.
+    ///
+    /// This is on the PTY output hot path and operates purely on `self`, so the
+    /// pump holds only this session's lock — never the registry lock.
+    pub fn append_to_scrollback(&mut self, data: &[u8]) {
+        self.scrollback.append_bytes(data, &mut self.partial_line);
+
+        let responses = match self.vt {
+            Some(ref mut vt) => {
+                vt.process(data);
+                vt.take_responses()
+            }
+            None => Vec::new(),
+        };
+
+        if responses.is_empty() {
+            return;
+        }
+
+        // Only answer queries ourselves when no real terminal is attached.
+        if self.attached_clients.is_empty() {
+            if let Some(ref mut writer) = self.pty_writer {
+                use std::io::Write;
+                if let Err(e) = writer.write_all(&responses).and_then(|()| writer.flush()) {
+                    // Robustness: never panic on a write error here. The PTY
+                    // may have just exited; log at debug and move on.
+                    tracing::debug!(
+                        session_id = %self.id.0,
+                        error = %e,
+                        "failed to write detached terminal-query response to pty"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Check the exit code of this session's child process.
+    pub fn check_exit_code(&mut self) -> Option<i32> {
+        if let Some(ref mut child) = self.pty_child {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status.exit_code() as i32),
+                Ok(None) => return None,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %self.id.0,
+                        error = %e,
+                        "failed to wait on child process"
+                    );
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    /// Broadcast an event to all subscribers of this session.
+    ///
+    /// Backpressure / resync policy: when a subscriber's channel is `Full`, the
+    /// client is lagging and would otherwise miss this event, silently
+    /// corrupting its screen. Instead of dropping the event, we send a fresh
+    /// `Event::StateSnapshot` built from this session's current `VtState` so the
+    /// client can repaint and self-heal once it drains its backlog. The
+    /// snapshot is only built on the `Full` path — never on the normal hot path.
+    /// If the channel is still full even for the snapshot, we keep the
+    /// subscriber (best-effort) and record a warning. `Closed` -> drop.
+    ///
+    /// Operates purely on `self`, so the pump broadcasts while holding only this
+    /// session's lock.
+    pub fn broadcast_event(&mut self, event: Event) {
+        // Split the borrow so the `retain` closure can mutate the subscriber
+        // list while still reading the VT for a resync snapshot.
+        let session_id = &self.id;
+        let subscribers = &mut self.subscribers;
+        let vt = &self.vt;
+        let last_size = self.last_size;
+
+        // Lazily built only when at least one subscriber is full, so the
+        // (potentially expensive) snapshot is never produced on the normal hot
+        // path. Built from the live VT in this same locked session struct.
+        let mut resync: Option<Event> = None;
+        subscribers.retain(|tx| match tx.try_send(event.clone()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let snapshot_event = resync.get_or_insert_with(|| Event::StateSnapshot {
+                    session: session_id.clone(),
+                    snapshot: vt.as_ref().map(|vt| vt.snapshot()).unwrap_or_else(|| {
+                        TerminalSnapshot {
+                            cols: last_size.cols,
+                            rows: last_size.rows,
+                            cells: Vec::new(),
+                            cursor_row: 0,
+                            cursor_col: 0,
+                            alternate_screen: false,
+                        }
+                    }),
+                });
+                match tx.try_send(snapshot_event.clone()) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            "subscriber lagging, sent resync snapshot"
+                        );
+                        true
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            "subscriber channel full even for resync snapshot, keeping subscriber"
+                        );
+                        true
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        });
+    }
+
+    /// Mark this session as exited, tearing down its live PTY/VT handles.
+    ///
+    /// Operates purely on `self`. Scrollback persistence (which needs `Config`)
+    /// is handled separately by the caller before this is invoked.
+    pub fn mark_exited(&mut self, exit_code: Option<i32>) {
+        self.status = SessionStatus::Exited;
+        self.last_exit_code = exit_code;
+        self.updated_at = chrono::Utc::now();
+        self.pty_reader = None;
+        self.pty_writer = None;
+        self.pty_child = None;
+        self.master_pty = None;
+
+        tracing::info!(
+            session_id = %self.id.0,
+            exit_code = ?exit_code,
+            "session exited"
+        );
+    }
 }
 
-/// The session registry, protected by a Mutex.
+/// The session registry.
+///
+/// The registry (this struct) is itself protected by an outer `Mutex` (see
+/// [`SharedSessionManager`]) guarding the `sessions` map and the `name_index`.
+/// Each session lives behind its OWN `Mutex` ([`SharedSessionHandle`]), so the
+/// PTY output hot path can lock a single session without contending on the
+/// registry.
+///
+/// **Lock ordering (no inversion):** the only nesting allowed is
+/// `registry -> handle`. Registry methods may lock a handle while the registry
+/// lock is held, but the PTY pump locks ONLY a handle (after cloning its
+/// `Arc<Mutex<..>>` from the registry and releasing the registry lock), so it
+/// never acquires the registry lock while holding a handle lock. No two handle
+/// locks are ever held simultaneously — registry iteration (e.g.
+/// `list_sessions`) locks one handle, finishes with it, then moves on.
 pub struct SessionManager {
     config: Config,
-    sessions: HashMap<SessionId, SessionHandle>,
+    sessions: HashMap<SessionId, SharedSessionHandle>,
     name_index: HashMap<String, SessionId>,
 }
 
@@ -120,19 +510,34 @@ impl SessionManager {
         }
     }
 
-    /// Get a reference to a session handle by selector.
-    fn get_session(&self, selector: &SessionSelector) -> Result<&SessionHandle, RemuxError> {
+    /// Clone the shared handle for a resolved id. Acquires nothing on the handle
+    /// itself — only clones the `Arc` — so the caller can release the registry
+    /// lock before locking the handle.
+    pub fn get_handle(&self, session_id: &SessionId) -> Option<SharedSessionHandle> {
+        self.sessions.get(session_id).cloned()
+    }
+
+    /// Resolve a selector and clone its shared handle in one step. The registry
+    /// lock is held only for the duration of this call; the caller then locks
+    /// the returned handle, guaranteeing the `registry -> handle` order.
+    pub fn resolve_handle(
+        &self,
+        selector: &SessionSelector,
+    ) -> Result<SharedSessionHandle, RemuxError> {
         let id = self.resolve_selector(selector)?;
         self.sessions
             .get(&id)
+            .cloned()
             .ok_or_else(|| RemuxError::SessionNotFound(format!("{id:?}")))
     }
 
-    /// Create a new session from a create request.
+    /// Create a new session from a create request. Returns the new id, the
+    /// details, and the shared handle (so the caller can start the PTY pump
+    /// from a handle clone without re-locking the registry).
     pub fn create_session(
         &mut self,
         req: CreateSessionRequest,
-    ) -> Result<(SessionId, SessionDetails), RemuxError> {
+    ) -> Result<(SessionId, SessionDetails, SharedSessionHandle), RemuxError> {
         let name = req.name.unwrap_or_else(|| {
             req.cwd
                 .as_ref()
@@ -189,8 +594,9 @@ impl SessionManager {
         };
 
         let details = handle.to_details();
+        let shared = Arc::new(Mutex::new(handle));
         self.name_index.insert(name.clone(), id.clone());
-        self.sessions.insert(id.clone(), handle);
+        self.sessions.insert(id.clone(), shared.clone());
 
         // Persist session metadata
         if let Err(e) = persistence::save_session(
@@ -208,53 +614,22 @@ impl SessionManager {
 
         tracing::info!(session_id = %id.0, pid = ?details.pid, "created new session");
 
-        Ok((id, details))
+        Ok((id, details, shared))
     }
 
-    /// List all sessions.
-    pub fn list_sessions(&self) -> Vec<SessionSummary> {
-        self.sessions.values().map(|h| h.to_summary()).collect()
+    /// List all sessions. Locks each handle one at a time (registry -> handle,
+    /// never two handles at once) to build the summaries.
+    pub async fn list_sessions(&self) -> Vec<SessionSummary> {
+        let handles: Vec<SharedSessionHandle> = self.sessions.values().cloned().collect();
+        let mut out = Vec::with_capacity(handles.len());
+        for h in handles {
+            out.push(h.lock().await.to_summary());
+        }
+        out
     }
 
-    /// Inspect a session.
-    pub fn inspect_session(
-        &self,
-        selector: &SessionSelector,
-    ) -> Result<SessionDetails, RemuxError> {
-        Ok(self.get_session(selector)?.to_details())
-    }
-
-    /// Kill a session by sending a signal.
-    pub fn kill_session(
-        &mut self,
-        selector: &SessionSelector,
-        signal: Option<i32>,
-    ) -> Result<(), RemuxError> {
-        let id = self.resolve_selector(selector)?;
-        let session = self
-            .sessions
-            .get_mut(&id)
-            .ok_or_else(|| RemuxError::SessionNotFound(format!("{id:?}")))?;
-
-        let sig = signal.unwrap_or(nix::sys::signal::Signal::SIGTERM as i32);
-        let raw_pid = match session.pid {
-            Some(pid) => pid,
-            None => return Ok(()), // session already exited, nothing to kill
-        };
-        let pid = nix::unistd::Pid::from_raw(raw_pid as i32);
-        let pgid = nix::unistd::getpgid(Some(pid))
-            .map_err(|e| RemuxError::PtyError(format!("failed to get pgid: {e}")))?;
-        let nix_signal = nix::sys::signal::Signal::try_from(sig)
-            .map_err(|e| RemuxError::InvalidRequest(format!("invalid signal: {e}")))?;
-        nix::sys::signal::kill(pgid, nix_signal)
-            .map_err(|e| RemuxError::PtyError(format!("failed to kill: {e}")))?;
-
-        tracing::info!(session_id = %id.0, signal = ?signal, "killed session");
-        Ok(())
-    }
-
-    /// Rename a session.
-    pub fn rename_session(
+    /// Rename a session, updating the registry `name_index` and the handle.
+    pub async fn rename_session(
         &mut self,
         selector: &SessionSelector,
         new_name: String,
@@ -264,477 +639,67 @@ impl SessionManager {
         }
 
         let id = self.resolve_selector(selector)?;
-
-        if let Some(session) = self.sessions.get(&id) {
-            let old_name = session.name.clone();
-            self.name_index.remove(&old_name);
-        }
-
-        if let Some(session) = self.sessions.get_mut(&id) {
-            session.name = new_name.clone();
-            session.updated_at = chrono::Utc::now();
-            self.name_index.insert(new_name.clone(), id.clone());
-
-            // Update persisted metadata
-            if let Err(e) = persistence::save_session(
-                &self.config,
-                &persistence::PersistedSession {
-                    id: id.clone(),
-                    name: new_name,
-                    command: session.command.clone(),
-                    cwd: session.cwd.clone(),
-                    created_at: session.created_at,
-                },
-            ) {
-                tracing::warn!(session_id = %id.0, error = %e, "failed to persist renamed session");
-            }
-
-            tracing::info!(session_id = %session.id.0, "renamed session");
-        }
-
-        Ok(())
-    }
-
-    /// Attach a client to a session. Returns bootstrap data and an event receiver.
-    pub fn attach_session(
-        &mut self,
-        selector: &SessionSelector,
-        size: TermSize,
-        mode: AttachMode,
-        client_id: ClientId,
-    ) -> Result<(AttachBootstrap, mpsc::Receiver<Event>), RemuxError> {
-        let id = self.resolve_selector(selector)?;
-
-        let session = self
-            .sessions
-            .get_mut(&id)
-            .ok_or_else(|| RemuxError::SessionNotFound(format!("{id:?}")))?;
-
-        if session.status == SessionStatus::Exited {
-            return Err(RemuxError::SessionExited(session.last_exit_code));
-        }
-
-        if mode == AttachMode::Control {
-            if let Some(ref ctrl) = session.controlling_client {
-                if *ctrl == client_id {
-                    return Err(RemuxError::AlreadyAttached(session.name.clone()));
-                }
-                // Notify the old controlling client that control was taken
-                let old_client_id = ctrl.clone();
-                let control_lost_event = Event::ControlLost {
-                    session: session.id.clone(),
-                };
-                session
-                    .subscribers
-                    .retain(|tx| match tx.try_send(control_lost_event.clone()) {
-                        Ok(()) => true,
-                        Err(mpsc::error::TrySendError::Full(_)) => true,
-                        Err(mpsc::error::TrySendError::Closed(_)) => false,
-                    });
-                tracing::info!(
-                    session_id = %session.id.0,
-                    old_client = ?old_client_id,
-                    new_client = ?client_id,
-                    "stealing control from old client"
-                );
-            }
-            session.controlling_client = Some(client_id.clone());
-        }
-
-        if !session.attached_clients.contains(&client_id) {
-            session.attached_clients.push(client_id.clone());
-        }
-
-        let (tx, rx) = mpsc::channel(256);
-        session.subscribers.push(tx);
-
-        // Resize PTY if this is the controlling client
-        if mode == AttachMode::Control {
-            session.last_size = size;
-            if let Some(ref master) = session.master_pty {
-                if let Err(e) = pty::resize_pty_master(master.as_ref(), size) {
-                    tracing::warn!(
-                        session_id = %session.id.0,
-                        error = %e,
-                        "failed to resize pty on attach"
-                    );
-                }
-            }
-            // Also resize the VT so the snapshot grid matches the client's
-            // terminal dimensions (otherwise reattach paints a stale size).
-            if let Some(ref mut vt) = session.vt {
-                vt.resize(size);
-            }
-        }
-
-        session.updated_at = chrono::Utc::now();
-
-        let scrollback_bytes = session.scrollback.read_all_bytes();
-        let details = session.to_details();
-        let vt_snapshot = session.vt.as_ref().map(|vt| vt.snapshot());
-
-        let bootstrap = AttachBootstrap {
-            session: details,
-            scrollback: scrollback_bytes,
-            vt_snapshot,
+        let handle = match self.sessions.get(&id) {
+            Some(h) => h.clone(),
+            None => return Err(RemuxError::SessionNotFound(format!("{id:?}"))),
         };
 
-        tracing::info!(
-            session_id = %id.0,
-            client_id = ?client_id,
-            mode = ?mode,
-            "client attached to session"
-        );
+        // Lock the single handle (registry lock is held by the caller of this
+        // async method, but we never lock a second handle, so no inversion).
+        let mut session = handle.lock().await;
+        let old_name = session.name.clone();
+        self.name_index.remove(&old_name);
 
-        Ok((bootstrap, rx))
-    }
-
-    /// Detach a client from a session.
-    pub fn detach_session(
-        &mut self,
-        selector: &SessionSelector,
-        client_id: &ClientId,
-    ) -> Result<(), RemuxError> {
-        let id = self.resolve_selector(selector)?;
-
-        let session = self
-            .sessions
-            .get_mut(&id)
-            .ok_or_else(|| RemuxError::SessionNotFound(format!("{id:?}")))?;
-
-        let was_attached = session.attached_clients.iter().any(|c| c == client_id);
-        if !was_attached {
-            return Err(RemuxError::NotAttached);
-        }
-
-        session.attached_clients.retain(|c| c != client_id);
-
-        if session.controlling_client.as_ref() == Some(client_id) {
-            session.controlling_client = None;
-        }
-
-        session.subscribers.retain(|tx| !tx.is_closed());
+        session.name = new_name.clone();
         session.updated_at = chrono::Utc::now();
+        self.name_index.insert(new_name.clone(), id.clone());
 
-        tracing::info!(
-            session_id = %id.0,
-            client_id = ?client_id,
-            "client detached from session"
-        );
+        // Update persisted metadata
+        if let Err(e) = persistence::save_session(
+            &self.config,
+            &persistence::PersistedSession {
+                id: id.clone(),
+                name: new_name,
+                command: session.command.clone(),
+                cwd: session.cwd.clone(),
+                created_at: session.created_at,
+            },
+        ) {
+            tracing::warn!(session_id = %id.0, error = %e, "failed to persist renamed session");
+        }
+
+        tracing::info!(session_id = %session.id.0, "renamed session");
 
         Ok(())
     }
 
-    /// Resize a session's PTY.
-    pub fn resize_session(
-        &mut self,
-        selector: &SessionSelector,
-        size: TermSize,
-        client_id: &ClientId,
-    ) -> Result<(), RemuxError> {
-        let id = self.resolve_selector(selector)?;
-
-        let session = self
-            .sessions
-            .get_mut(&id)
-            .ok_or_else(|| RemuxError::SessionNotFound(format!("{id:?}")))?;
-
-        if session.controlling_client.as_ref() != Some(client_id) {
-            return Err(RemuxError::PermissionDenied);
+    /// Persist a single session's scrollback to disk (when enabled), reading the
+    /// already-locked handle. Used on the exit path before `mark_exited`.
+    pub fn persist_scrollback_for(&self, session: &SessionHandle) {
+        if !self.config.daemon.persist_scrollback {
+            return;
         }
-
-        if let Some(ref master) = session.master_pty {
-            pty::resize_pty_master(master.as_ref(), size)?;
-        }
-
-        // Also resize the VT state if present
-        if let Some(ref mut vt) = session.vt {
-            vt.resize(size);
-        }
-
-        session.last_size = size;
-        session.updated_at = chrono::Utc::now();
-
-        tracing::debug!(
-            session_id = %id.0,
-            cols = size.cols,
-            rows = size.rows,
-            "resized session"
-        );
-        Ok(())
-    }
-
-    /// Send input data to a session's PTY.
-    ///
-    /// Permission rule: input is allowed when the client is the controlling
-    /// client, OR when the client is not attached at all (a pure headless
-    /// injector, e.g. `remux send`). Input is denied only when the client IS
-    /// attached but is not the controller — i.e. an observer. This preserves
-    /// the observer read-only guarantee while enabling headless injection.
-    pub fn send_input_for_client(
-        &mut self,
-        selector: &SessionSelector,
-        data: Vec<u8>,
-        client_id: &ClientId,
-    ) -> Result<(), RemuxError> {
-        let id = self.resolve_selector(selector)?;
-
-        let session = self
-            .sessions
-            .get_mut(&id)
-            .ok_or_else(|| RemuxError::SessionNotFound(format!("{id:?}")))?;
-
-        let is_controller = session.controlling_client.as_ref() == Some(client_id);
-        let is_attached = session.attached_clients.iter().any(|c| c == client_id);
-        // Deny only attached observers (attached but not controlling).
-        if !is_controller && is_attached {
-            return Err(RemuxError::PermissionDenied);
-        }
-
-        if session.status == SessionStatus::Exited {
-            return Err(RemuxError::SessionExited(session.last_exit_code));
-        }
-
-        if let Some(ref mut writer) = session.pty_writer {
-            use std::io::Write;
-            writer
-                .write_all(&data)
-                .map_err(|e| RemuxError::PtyError(format!("failed to write to pty: {e}")))?;
-            writer
-                .flush()
-                .map_err(|e| RemuxError::PtyError(format!("failed to flush pty: {e}")))?;
-        } else {
-            return Err(RemuxError::SessionExited(None));
-        }
-
-        Ok(())
-    }
-
-    /// Read scrollback from a session.
-    pub fn read_scrollback(
-        &self,
-        selector: &SessionSelector,
-        lines: usize,
-    ) -> Result<ScrollbackChunk, RemuxError> {
-        let session = self.get_session(selector)?;
-
-        let line_data = session.scrollback.read_last(lines);
-        let mut data = Vec::new();
-        for line in &line_data {
-            data.extend_from_slice(line);
-            data.push(b'\n');
-        }
-
-        Ok(ScrollbackChunk {
-            data,
-            lines: line_data.len(),
-        })
-    }
-
-    /// Capture the current screen of a session as a `TerminalSnapshot`.
-    ///
-    /// Resolves the session and returns a snapshot of its live VT state. Errors
-    /// if the session is unknown or has no VT (e.g. an exited session whose VT
-    /// has been torn down).
-    pub fn capture_screen(
-        &self,
-        selector: &SessionSelector,
-    ) -> Result<TerminalSnapshot, RemuxError> {
-        let session = self.get_session(selector)?;
-        session.vt.as_ref().map(|vt| vt.snapshot()).ok_or_else(|| {
-            RemuxError::InvalidRequest(format!(
-                "session {} has no terminal state to capture",
-                session.name
-            ))
-        })
-    }
-
-    /// Take the PTY master reader out of a session (for the PTY pump task).
-    pub fn take_pty_reader(
-        &mut self,
-        session_id: &SessionId,
-    ) -> Option<Box<dyn std::io::Read + Send + 'static>> {
-        if let Some(session) = self.sessions.get_mut(session_id) {
-            session.pty_reader.take()
-        } else {
-            None
-        }
-    }
-
-    /// Append raw bytes to a session's scrollback buffer and update VT state.
-    ///
-    /// After feeding the bytes through the VT, drain any responses the terminal
-    /// generated (replies to Device Attributes / cursor-position / device-status
-    /// queries). Detached terminal-query answering: if NO client is currently
-    /// attached, the daemon writes those replies back to the PTY itself so a
-    /// backgrounded TUI that queried the terminal doesn't hang waiting for an
-    /// answer. If a client IS attached, the responses are discarded — the
-    /// client's real terminal answers the queries, and writing them here too
-    /// would double-answer.
-    pub fn append_to_scrollback(&mut self, session_id: &SessionId, data: &[u8]) {
-        if let Some(session) = self.sessions.get_mut(session_id) {
-            session
-                .scrollback
-                .append_bytes(data, &mut session.partial_line);
-
-            let responses = match session.vt {
-                Some(ref mut vt) => {
-                    vt.process(data);
-                    vt.take_responses()
-                }
-                None => Vec::new(),
-            };
-
-            if responses.is_empty() {
-                return;
-            }
-
-            // Only answer queries ourselves when no real terminal is attached.
-            if session.attached_clients.is_empty() {
-                if let Some(ref mut writer) = session.pty_writer {
-                    use std::io::Write;
-                    if let Err(e) = writer.write_all(&responses).and_then(|()| writer.flush()) {
-                        // Robustness: never panic on a write error here. The PTY
-                        // may have just exited; log at debug and move on.
-                        tracing::debug!(
-                            session_id = %session_id.0,
-                            error = %e,
-                            "failed to write detached terminal-query response to pty"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// Check the exit code of a session's child process.
-    pub fn check_exit_code(&mut self, session_id: &SessionId) -> Option<i32> {
-        if let Some(session) = self.sessions.get_mut(session_id) {
-            if let Some(ref mut child) = session.pty_child {
-                match child.try_wait() {
-                    Ok(Some(status)) => return Some(status.exit_code() as i32),
-                    Ok(None) => return None,
-                    Err(e) => {
-                        tracing::warn!(
-                            session_id = %session_id.0,
-                            error = %e,
-                            "failed to wait on child process"
-                        );
-                        return None;
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Broadcast an event to all subscribers of a session.
-    ///
-    /// Backpressure / resync policy: when a subscriber's channel is `Full`, the
-    /// client is lagging and would otherwise miss this event, silently
-    /// corrupting its screen. Instead of dropping the event, we send a fresh
-    /// `Event::StateSnapshot` built from the session's current `VtState` so the
-    /// client can repaint and self-heal once it drains its backlog. The
-    /// snapshot is only built on the `Full` path — never on the normal hot path.
-    /// If the channel is still full even for the snapshot, we keep the
-    /// subscriber (best-effort) and record a warning. `Closed` -> drop.
-    pub fn broadcast_event(&mut self, session_id: &SessionId, event: Event) {
-        if let Some(session) = self.sessions.get_mut(session_id) {
-            // Split the session borrow so the `retain` closure can mutate the
-            // subscriber list while still reading the VT for a resync snapshot.
-            let subscribers = &mut session.subscribers;
-            let vt = &session.vt;
-            let last_size = session.last_size;
-
-            // Lazily built only when at least one subscriber is full, so the
-            // (potentially expensive) snapshot is never produced on the normal
-            // hot path. Built from the live VT in this same locked session
-            // struct — no second lock acquisition.
-            let mut resync: Option<Event> = None;
-            subscribers.retain(|tx| match tx.try_send(event.clone()) {
-                Ok(()) => true,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    let snapshot_event = resync.get_or_insert_with(|| Event::StateSnapshot {
-                        session: session_id.clone(),
-                        snapshot: vt.as_ref().map(|vt| vt.snapshot()).unwrap_or_else(|| {
-                            TerminalSnapshot {
-                                cols: last_size.cols,
-                                rows: last_size.rows,
-                                cells: Vec::new(),
-                                cursor_row: 0,
-                                cursor_col: 0,
-                                alternate_screen: false,
-                            }
-                        }),
-                    });
-                    match tx.try_send(snapshot_event.clone()) {
-                        Ok(()) => {
-                            tracing::warn!(
-                                session_id = %session_id.0,
-                                "subscriber lagging, sent resync snapshot"
-                            );
-                            true
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            tracing::warn!(
-                                session_id = %session_id.0,
-                                "subscriber channel full even for resync snapshot, keeping subscriber"
-                            );
-                            true
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => false,
-                    }
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => false,
-            });
-        }
-    }
-
-    /// Mark a session as exited.
-    pub fn mark_exited(&mut self, session_id: &SessionId, exit_code: Option<i32>) {
-        let persist = self.config.daemon.persist_scrollback;
-        // On the graceful/normal exit path, flush this session's scrollback to
-        // disk (when enabled) so it survives a daemon restart and is available
-        // via `logs`/`ReadScrollback` for the recovered Exited session.
-        if persist {
-            if let Some(session) = self.sessions.get(session_id) {
-                let lines = session.scrollback.read_all();
-                if let Err(e) = persistence::save_scrollback(&self.config, session_id, &lines) {
-                    tracing::warn!(session_id = %session_id.0, error = %e, "failed to flush scrollback on exit");
-                }
-            }
-        }
-
-        if let Some(session) = self.sessions.get_mut(session_id) {
-            session.status = SessionStatus::Exited;
-            session.last_exit_code = exit_code;
-            session.updated_at = chrono::Utc::now();
-            session.pty_reader = None;
-            session.pty_writer = None;
-            session.pty_child = None;
-            session.master_pty = None;
-
-            tracing::info!(
-                session_id = %session_id.0,
-                exit_code = ?exit_code,
-                "session exited"
-            );
+        let lines = session.scrollback.read_all();
+        if let Err(e) = persistence::save_scrollback(&self.config, &session.id, &lines) {
+            tracing::warn!(session_id = %session.id.0, error = %e, "failed to flush scrollback on exit");
         }
     }
 
     /// Flush every live session's scrollback to disk for crash-resilience.
     ///
     /// Called periodically by a background task when `persist_scrollback` is
-    /// enabled. The manager lock is held for the duration, but the work is just
-    /// cloning each session's line buffer and writing it — bounded by
-    /// `max_scrollback_lines` per session — so the hold is short. Only sessions
-    /// that are still running are flushed here; exited sessions were already
-    /// flushed by `mark_exited`.
-    pub fn flush_all_scrollback(&self) {
+    /// enabled. Each handle is locked one at a time (registry -> handle, never
+    /// two handles simultaneously); the work is just cloning the line buffer and
+    /// writing it — bounded by `max_scrollback_lines` per session. Only running
+    /// sessions are flushed here; exited sessions were already flushed by the
+    /// exit path.
+    pub async fn flush_all_scrollback(&self) {
         if !self.config.daemon.persist_scrollback {
             return;
         }
-        for session in self.sessions.values() {
+        let handles: Vec<SharedSessionHandle> = self.sessions.values().cloned().collect();
+        for h in handles {
+            let session = h.lock().await;
             if session.status == SessionStatus::Exited {
                 continue;
             }
@@ -811,7 +776,7 @@ impl SessionManager {
             };
 
             self.name_index.insert(meta.name, meta.id.clone());
-            self.sessions.insert(meta.id, handle);
+            self.sessions.insert(meta.id, Arc::new(Mutex::new(handle)));
             recovered += 1;
         }
 
@@ -842,6 +807,27 @@ mod tests {
         }
     }
 
+    /// Helper mirroring the daemon's two-phase lookup: resolve + clone the
+    /// handle under the registry lock, then read it under the handle lock.
+    async fn details_for(
+        mgr: &SessionManager,
+        selector: &SessionSelector,
+    ) -> Result<SessionDetails, RemuxError> {
+        let handle = mgr.resolve_handle(selector)?;
+        let details = handle.lock().await.to_details();
+        Ok(details)
+    }
+
+    async fn scrollback_for(
+        mgr: &SessionManager,
+        selector: &SessionSelector,
+        lines: usize,
+    ) -> Result<ScrollbackChunk, RemuxError> {
+        let handle = mgr.resolve_handle(selector)?;
+        let chunk = handle.lock().await.read_scrollback(lines);
+        Ok(chunk)
+    }
+
     /// Simulates a daemon restart at the `SessionManager` level: a prior daemon
     /// persisted metadata + scrollback to disk; a fresh manager recovers them.
     ///
@@ -851,8 +837,8 @@ mod tests {
     /// asserting Option A semantics — recovered session is `Exited`, its
     /// scrollback is readable via `read_scrollback`, and it is reachable by
     /// name and id.
-    #[test]
-    fn load_persisted_recovers_exited_session_with_scrollback() {
+    #[tokio::test]
+    async fn load_persisted_recovers_exited_session_with_scrollback() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_dir(dir.path(), true);
 
@@ -881,8 +867,8 @@ mod tests {
         mgr.load_persisted();
 
         // Reachable by id and by name (name_index populated).
-        let by_name = mgr
-            .inspect_session(&SessionSelector::Name("recovered".to_string()))
+        let by_name = details_for(&mgr, &SessionSelector::Name("recovered".to_string()))
+            .await
             .expect("recovered session reachable by name");
         assert_eq!(by_name.id, id);
         // Marked Exited with no live process.
@@ -891,11 +877,11 @@ mod tests {
         assert_eq!(by_name.last_exit_code, None);
 
         // Appears in `list`.
-        assert_eq!(mgr.list_sessions().len(), 1);
+        assert_eq!(mgr.list_sessions().await.len(), 1);
 
         // Scrollback restored and readable via `logs`/ReadScrollback.
-        let chunk = mgr
-            .read_scrollback(&SessionSelector::Id(id.clone()), 100)
+        let chunk = scrollback_for(&mgr, &SessionSelector::Id(id.clone()), 100)
+            .await
             .unwrap();
         assert_eq!(chunk.lines, 2);
         assert_eq!(chunk.data, b"hello world\nsecond line\n");
@@ -903,8 +889,8 @@ mod tests {
 
     /// With `persist_scrollback = false`, metadata is still recovered but no
     /// scrollback is loaded back.
-    #[test]
-    fn load_persisted_without_scrollback_persistence() {
+    #[tokio::test]
+    async fn load_persisted_without_scrollback_persistence() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_dir(dir.path(), false);
 
@@ -927,20 +913,22 @@ mod tests {
         let mut mgr = SessionManager::new(config);
         mgr.load_persisted();
 
-        let details = mgr
-            .inspect_session(&SessionSelector::Id(id.clone()))
+        let details = details_for(&mgr, &SessionSelector::Id(id.clone()))
+            .await
             .expect("metadata recovered");
         assert_eq!(details.status, SessionStatus::Exited);
 
-        let chunk = mgr.read_scrollback(&SessionSelector::Id(id), 100).unwrap();
+        let chunk = scrollback_for(&mgr, &SessionSelector::Id(id), 100)
+            .await
+            .unwrap();
         assert_eq!(chunk.lines, 0);
         assert!(chunk.data.is_empty());
     }
 
     /// Recovered sessions must not block; a duplicate persisted name is skipped
     /// (first wins) rather than panicking.
-    #[test]
-    fn load_persisted_skips_name_collision() {
+    #[tokio::test]
+    async fn load_persisted_skips_name_collision() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_dir(dir.path(), false);
 
@@ -962,9 +950,94 @@ mod tests {
         mgr.load_persisted();
 
         // Both files share a name; exactly one is indexed/recovered.
-        assert_eq!(mgr.list_sessions().len(), 1);
-        assert!(mgr
-            .inspect_session(&SessionSelector::Name("dup".to_string()))
+        assert_eq!(mgr.list_sessions().await.len(), 1);
+        assert!(details_for(&mgr, &SessionSelector::Name("dup".to_string()))
+            .await
             .is_ok());
+    }
+
+    /// Per-session locking smoke test: create several sessions and drive output
+    /// + broadcast concurrently, each task holding only its own handle lock.
+    /// Asserts no deadlock and that scrollback/VT updates land on the right
+    /// session. Uses recovered (no-PTY) handles built directly so the test is
+    /// fast and deterministic (no real processes).
+    #[tokio::test]
+    async fn per_session_locking_concurrent_output_no_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_dir(dir.path(), false);
+        let mgr = Arc::new(Mutex::new(SessionManager::new(config)));
+
+        // Build several no-PTY handles directly into the registry.
+        let mut ids = Vec::new();
+        {
+            let mut m = mgr.lock().await;
+            for i in 0..8 {
+                let id = SessionId::new();
+                let handle = SessionHandle {
+                    id: id.clone(),
+                    name: format!("s{i}"),
+                    command: vec!["bash".to_string()],
+                    cwd: PathBuf::from("/tmp"),
+                    status: SessionStatus::Running,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                    last_exit_code: None,
+                    last_size: TermSize { cols: 80, rows: 24 },
+                    controlling_client: None,
+                    attached_clients: Vec::new(),
+                    pid: None,
+                    pty_reader: None,
+                    pty_writer: None,
+                    pty_child: None,
+                    master_pty: None,
+                    vt: Some(VtState::new(TermSize { cols: 80, rows: 24 }, 1000)),
+                    scrollback: ScrollbackBuffer::new(1000),
+                    partial_line: Vec::new(),
+                    subscribers: Vec::new(),
+                    pump_handle: None,
+                };
+                m.name_index.insert(format!("s{i}"), id.clone());
+                m.sessions.insert(id.clone(), Arc::new(Mutex::new(handle)));
+                ids.push(id);
+            }
+        }
+
+        // Each task does the two-phase lookup (registry -> handle), then drives
+        // its OWN handle many times. Tasks run concurrently; if the hot path
+        // touched the registry per chunk, this would serialize, but it must
+        // never deadlock.
+        let mut tasks = Vec::new();
+        for id in &ids {
+            let mgr = mgr.clone();
+            let id = id.clone();
+            tasks.push(tokio::spawn(async move {
+                let handle = {
+                    let m = mgr.lock().await;
+                    m.get_handle(&id).expect("handle present")
+                };
+                for n in 0..200 {
+                    let mut h = handle.lock().await;
+                    let line = format!("line {n}\r\n");
+                    h.append_to_scrollback(line.as_bytes());
+                    h.broadcast_event(Event::Output {
+                        session: id.clone(),
+                        data: line.into_bytes(),
+                    });
+                }
+            }));
+        }
+
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        // Every session must have accumulated its scrollback independently.
+        let m = mgr.lock().await;
+        for id in &ids {
+            let handle = m.get_handle(id).unwrap();
+            let h = handle.lock().await;
+            let chunk = h.read_scrollback(1000);
+            assert_eq!(chunk.lines, 200, "session {:?} lost output", id.0);
+        }
     }
 }

@@ -8,12 +8,10 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
 
 use remux_core::framing;
-use remux_core::{
-    ClientId, Config, Event, RemuxError, Request, Response, SessionId, SessionSelector,
-};
+use remux_core::{ClientId, Config, Event, RemuxError, Request, Response, SessionId};
 
 use crate::persistence;
-use crate::session_manager::{SessionManager, SharedSessionManager};
+use crate::session_manager::{SessionManager, SharedSessionHandle, SharedSessionManager};
 
 /// Interval between periodic scrollback flushes for crash-resilience.
 const SCROLLBACK_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
@@ -89,7 +87,7 @@ impl Daemon {
                 loop {
                     ticker.tick().await;
                     let mgr = flush_sessions.lock().await;
-                    mgr.flush_all_scrollback();
+                    mgr.flush_all_scrollback().await;
                 }
             });
         }
@@ -144,7 +142,7 @@ impl Daemon {
         // no-op when `persist_scrollback` is disabled.
         {
             let mgr = sessions.lock().await;
-            mgr.flush_all_scrollback();
+            mgr.flush_all_scrollback().await;
         }
 
         // (c) Remove the socket file so a subsequent daemon can bind cleanly.
@@ -308,10 +306,19 @@ async fn detach_tracked_sessions(
         return;
     }
 
-    let mut mgr = sessions.lock().await;
-    for sid in to_detach {
-        let selector = SessionSelector::Id(sid);
-        let _ = mgr.detach_session(&selector, client_id);
+    // Two-phase: clone each handle out of the registry (registry lock held only
+    // briefly), then detach each one under its own handle lock. We never hold
+    // the registry lock while locking a handle, and never lock two handles at
+    // once, so there is no lock-order inversion.
+    let handles: Vec<SharedSessionHandle> = {
+        let mgr = sessions.lock().await;
+        to_detach
+            .into_iter()
+            .filter_map(|sid| mgr.get_handle(&sid))
+            .collect()
+    };
+    for handle in handles {
+        let _ = handle.lock().await.detach(client_id);
     }
 }
 
@@ -342,15 +349,23 @@ async fn process_request_with_events(
         Request::Ping => (Some(Response::Pong), None, None),
 
         Request::ListSessions => {
+            // `list_sessions` locks each handle one at a time under the registry
+            // lock (registry -> handle, never two handles at once).
             let mgr = sessions.lock().await;
-            (Some(Response::SessionList(mgr.list_sessions())), None, None)
+            (
+                Some(Response::SessionList(mgr.list_sessions().await)),
+                None,
+                None,
+            )
         }
 
         Request::CreateSession(req) => {
             let mut mgr = sessions.lock().await;
             match mgr.create_session(req) {
-                Ok((session_id, details)) => {
-                    spawn_pty_pump(session_id, sessions.clone());
+                Ok((session_id, details, handle)) => {
+                    // Hand the freshly-created handle clone to the pump so it
+                    // never needs the registry lock on the hot path.
+                    spawn_pty_pump(session_id, handle, sessions.clone());
                     (Some(Response::Created(details)), None, None)
                 }
                 Err(e) => (Some(Response::Error(e)), None, None),
@@ -358,9 +373,18 @@ async fn process_request_with_events(
         }
 
         Request::InspectSession { session } => {
-            let mgr = sessions.lock().await;
-            match mgr.inspect_session(&session) {
-                Ok(details) => (Some(Response::SessionDetails(details)), None, None),
+            // Two-phase: resolve + clone the handle under the registry lock,
+            // release it, then read the handle under its own lock.
+            let handle = {
+                let mgr = sessions.lock().await;
+                mgr.resolve_handle(&session)
+            };
+            match handle {
+                Ok(h) => (
+                    Some(Response::SessionDetails(h.lock().await.to_details())),
+                    None,
+                    None,
+                ),
                 Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
@@ -371,13 +395,28 @@ async fn process_request_with_events(
             mode,
             client_id: _,
         } => {
-            let mut mgr = sessions.lock().await;
-            match mgr.attach_session(&session, size, mode, client_id.clone()) {
-                Ok((bootstrap, rx)) => {
-                    // Record the resolved id so disconnect cleanup is
-                    // O(attached) rather than O(total sessions).
-                    let sid = mgr.resolve_selector(&session).ok();
-                    (Some(Response::Attached(bootstrap)), Some(rx), sid)
+            // Resolve id + clone handle under the registry lock, then attach
+            // under the handle lock only.
+            let resolved = {
+                let mgr = sessions.lock().await;
+                match mgr.resolve_selector(&session) {
+                    Ok(id) => match mgr.get_handle(&id) {
+                        Some(h) => Ok((id.clone(), h)),
+                        None => Err(RemuxError::SessionNotFound(format!("{id:?}"))),
+                    },
+                    Err(e) => Err(e),
+                }
+            };
+            match resolved {
+                Ok((sid, handle)) => {
+                    match handle.lock().await.attach(size, mode, client_id.clone()) {
+                        Ok((bootstrap, rx)) => {
+                            // Record the resolved id so disconnect cleanup is
+                            // O(attached) rather than O(total sessions).
+                            (Some(Response::Attached(bootstrap)), Some(rx), Some(sid))
+                        }
+                        Err(e) => (Some(Response::Error(e)), None, None),
+                    }
                 }
                 Err(e) => (Some(Response::Error(e)), None, None),
             }
@@ -387,9 +426,15 @@ async fn process_request_with_events(
             session,
             client_id: _,
         } => {
-            let mut mgr = sessions.lock().await;
-            match mgr.detach_session(&session, client_id) {
-                Ok(()) => (Some(Response::Ok), None, None),
+            let handle = {
+                let mgr = sessions.lock().await;
+                mgr.resolve_handle(&session)
+            };
+            match handle {
+                Ok(h) => match h.lock().await.detach(client_id) {
+                    Ok(()) => (Some(Response::Ok), None, None),
+                    Err(e) => (Some(Response::Error(e)), None, None),
+                },
                 Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
@@ -399,68 +444,103 @@ async fn process_request_with_events(
             size,
             client_id: _,
         } => {
-            let mut mgr = sessions.lock().await;
-            match mgr.resize_session(&session, size, client_id) {
-                Ok(()) => (Some(Response::Ok), None, None),
+            let handle = {
+                let mgr = sessions.lock().await;
+                mgr.resolve_handle(&session)
+            };
+            match handle {
+                Ok(h) => match h.lock().await.resize(size, client_id) {
+                    Ok(()) => (Some(Response::Ok), None, None),
+                    Err(e) => (Some(Response::Error(e)), None, None),
+                },
                 Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
 
         Request::SendInput { session, data } => {
-            let mut mgr = sessions.lock().await;
-            // Only the controlling client may send input
-            match mgr.send_input_for_client(&session, data, client_id) {
-                Ok(()) => (None, None, None),
+            let handle = {
+                let mgr = sessions.lock().await;
+                mgr.resolve_handle(&session)
+            };
+            // Only the controlling client (or a non-attached headless injector)
+            // may send input — enforced inside `send_input`.
+            match handle {
+                Ok(h) => match h.lock().await.send_input(&data, client_id) {
+                    Ok(()) => (None, None, None),
+                    Err(e) => (Some(Response::Error(e)), None, None),
+                },
                 Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
 
         Request::ReadScrollback { session, lines } => {
-            let mgr = sessions.lock().await;
-            match mgr.read_scrollback(&session, lines) {
-                Ok(chunk) => (Some(Response::Scrollback(chunk)), None, None),
+            let handle = {
+                let mgr = sessions.lock().await;
+                mgr.resolve_handle(&session)
+            };
+            match handle {
+                Ok(h) => (
+                    Some(Response::Scrollback(h.lock().await.read_scrollback(lines))),
+                    None,
+                    None,
+                ),
                 Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
 
         Request::RenameSession { session, new_name } => {
+            // Rename touches the registry `name_index`, so it runs under the
+            // registry lock; it locks the single target handle internally
+            // (registry -> handle, no second handle).
             let mut mgr = sessions.lock().await;
-            match mgr.rename_session(&session, new_name) {
+            match mgr.rename_session(&session, new_name).await {
                 Ok(()) => (Some(Response::Ok), None, None),
                 Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
 
         Request::CaptureScreen { session } => {
-            let mgr = sessions.lock().await;
-            match mgr.capture_screen(&session) {
-                Ok(snapshot) => (Some(Response::Screen(snapshot)), None, None),
+            let handle = {
+                let mgr = sessions.lock().await;
+                mgr.resolve_handle(&session)
+            };
+            match handle {
+                Ok(h) => match h.lock().await.capture_screen() {
+                    Ok(snapshot) => (Some(Response::Screen(snapshot)), None, None),
+                    Err(e) => (Some(Response::Error(e)), None, None),
+                },
                 Err(e) => (Some(Response::Error(e)), None, None),
             }
         }
 
         Request::KillSession { session, signal } => {
-            let sid = {
+            let resolved = {
                 let mgr = sessions.lock().await;
-                mgr.resolve_selector(&session).ok()
+                match mgr.resolve_selector(&session) {
+                    Ok(id) => match mgr.get_handle(&id) {
+                        Some(h) => Ok((id.clone(), h)),
+                        None => Err(RemuxError::SessionNotFound(format!("{id:?}"))),
+                    },
+                    Err(e) => Err(e),
+                }
             };
-
-            let mut mgr = sessions.lock().await;
-            match mgr.kill_session(&session, signal) {
-                Ok(()) => {
-                    // Do NOT broadcast a fake `SessionExited` here: the PTY pump
-                    // emits the authoritative one (with the real exit code) when
-                    // the process actually dies. Send only an informational
-                    // `SessionTerminating` so clients get instant feedback.
-                    if let Some(ref id) = sid {
-                        mgr.broadcast_event(
-                            id,
-                            Event::SessionTerminating {
+            match resolved {
+                Ok((id, handle)) => {
+                    let mut h = handle.lock().await;
+                    match h.kill(signal) {
+                        Ok(()) => {
+                            // Do NOT broadcast a fake `SessionExited` here: the
+                            // PTY pump emits the authoritative one (with the real
+                            // exit code) when the process actually dies. Send only
+                            // an informational `SessionTerminating` for instant
+                            // feedback — on this same locked handle.
+                            h.broadcast_event(Event::SessionTerminating {
                                 session: id.clone(),
-                            },
-                        );
+                            });
+                            (Some(Response::Ok), None, None)
+                        }
+                        Err(e) => (Some(Response::Error(e)), None, None),
                     }
-                    (Some(Response::Ok), None, None)
                 }
                 Err(e) => (Some(Response::Error(e)), None, None),
             }
@@ -475,19 +555,32 @@ async fn process_request_with_events(
 /// 2. Appends output to the scrollback buffer
 /// 3. Fans out Output events to all subscriber channels
 /// 4. Detects process exit and emits SessionExited event
-fn spawn_pty_pump(session_id: SessionId, sessions: SharedSessionManager) {
+///
+/// **Per-session locking (the hot path):** the pump receives the session's
+/// `SharedSessionHandle` (an `Arc<Mutex<SessionHandle>>`) cloned once at
+/// creation time. On every output chunk it locks ONLY that handle — never the
+/// registry — so busy sessions never serialize on a single global mutex.
+///
+/// **No lock-order inversion:** the only place this task touches the registry
+/// is the exit path, where it needs `Config` for scrollback persistence. That
+/// registry access is done WITHOUT holding the handle lock (the handle is
+/// locked separately, afterwards), and the hot path holds only the handle. The
+/// pump never holds two handle locks at once, and never the registry lock while
+/// holding a handle lock.
+fn spawn_pty_pump(
+    session_id: SessionId,
+    handle: SharedSessionHandle,
+    sessions: SharedSessionManager,
+) {
     tokio::spawn(async move {
         tracing::debug!(session_id = %session_id.0, "starting PTY output pump");
 
-        // Extract the PTY reader from the session handle
-        let reader: Box<dyn std::io::Read + Send> = {
-            let mut mgr = sessions.lock().await;
-            match mgr.take_pty_reader(&session_id) {
-                Some(r) => r,
-                None => {
-                    tracing::error!(session_id = %session_id.0, "no PTY reader for session");
-                    return;
-                }
+        // Extract the PTY reader from the session handle (handle lock only).
+        let reader: Box<dyn std::io::Read + Send> = match handle.lock().await.take_pty_reader() {
+            Some(r) => r,
+            None => {
+                tracing::error!(session_id = %session_id.0, "no PTY reader for session");
+                return;
             }
         };
 
@@ -526,34 +619,43 @@ fn spawn_pty_pump(session_id: SessionId, sessions: SharedSessionManager) {
             }
         });
 
-        // Process output in the async context: update scrollback and fan out events
+        // Process output in the async context: update scrollback and fan out
+        // events. HOT PATH — locks ONLY this session's handle per chunk; the
+        // registry is never touched here, so independent sessions never
+        // contend.
         while let Some(data) = output_rx.recv().await {
-            let mut mgr = sessions.lock().await;
-            mgr.append_to_scrollback(&session_id, &data);
-            mgr.broadcast_event(
-                &session_id,
-                Event::Output {
-                    session: session_id.clone(),
-                    data,
-                },
-            );
+            let mut h = handle.lock().await;
+            h.append_to_scrollback(&data);
+            h.broadcast_event(Event::Output {
+                session: session_id.clone(),
+                data,
+            });
         }
 
         // Wait for the blocking read task to finish
         let _ = read_handle.await;
 
-        // Check exit code and mark session as exited
+        // Exit path. Scrollback persistence needs `Config`, which lives in the
+        // registry. We snapshot persistence intent without holding the handle
+        // lock, then operate on the handle alone — never both locks at once.
         {
-            let mut mgr = sessions.lock().await;
-            let exit_code = mgr.check_exit_code(&session_id);
-            mgr.mark_exited(&session_id, exit_code);
-            mgr.broadcast_event(
-                &session_id,
-                Event::SessionExited {
-                    session: session_id.clone(),
-                    exit_code,
-                },
-            );
+            // (1) Persist this session's scrollback (registry lock only; reads
+            // the handle separately inside `persist_scrollback_for`, which is
+            // registry -> handle ordering with no second handle).
+            {
+                let mgr = sessions.lock().await;
+                let session = handle.lock().await;
+                mgr.persist_scrollback_for(&session);
+            }
+
+            // (2) Mark exited + broadcast on the handle alone.
+            let mut h = handle.lock().await;
+            let exit_code = h.check_exit_code();
+            h.mark_exited(exit_code);
+            h.broadcast_event(Event::SessionExited {
+                session: session_id.clone(),
+                exit_code,
+            });
         }
 
         tracing::info!(session_id = %session_id.0, "PTY output pump finished");
