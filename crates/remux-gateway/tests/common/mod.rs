@@ -126,6 +126,50 @@ pub async fn start_gateway_with_auth_config(socket_path: PathBuf) -> GatewayHand
     start_gateway_with_auth(socket_path, auth).await
 }
 
+/// The HS256 shared secret the JWT e2e tests mint + validate with.
+pub const TEST_JWT_HS256_SECRET: &str = "test-jwt-hs256-secret-0123456789abcdef";
+
+/// Start the gateway with the static admin [`TEST_TOKEN`] AND a JWT/OIDC HS256
+/// validator using [`TEST_JWT_HS256_SECRET`]. Static tokens still work; a JWT
+/// signed with the secret authenticates via the same RBAC roles.
+pub async fn start_gateway_with_jwt(socket_path: PathBuf) -> GatewayHandle {
+    use remux_gateway::jwt_service::{JwtAuth, JwtSettings};
+    let settings = JwtSettings {
+        hs256_secret: Some(TEST_JWT_HS256_SECRET.to_string()),
+        ..Default::default()
+    };
+    let jwt = JwtAuth::from_settings(&settings)
+        .await
+        .expect("build jwt auth")
+        .expect("jwt enabled");
+    let auth = AuthConfig::new(TEST_TOKEN.to_string()).with_jwt(Some(jwt));
+    start_gateway_with_auth(socket_path, auth).await
+}
+
+/// Mint an HS256 JWT signed with [`TEST_JWT_HS256_SECRET`] carrying `sub` and a
+/// `roles` array, valid for one hour.
+pub fn mint_jwt(sub: &str, roles: &[&str]) -> String {
+    mint_jwt_with(sub, roles, 3600)
+}
+
+/// Mint an HS256 JWT with an explicit expiry offset (seconds from now; may be
+/// negative for an expired token).
+pub fn mint_jwt_with(sub: &str, roles: &[&str], exp_offset_secs: i64) -> String {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    let exp = jsonwebtoken::get_current_timestamp() as i64 + exp_offset_secs;
+    let claims = serde_json::json!({
+        "sub": sub,
+        "roles": roles,
+        "exp": exp,
+    });
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(TEST_JWT_HS256_SECRET.as_bytes()),
+    )
+    .expect("mint test JWT")
+}
+
 /// Start the gateway with the built-in browser client (AW5) **disabled**
 /// (`--no-web-ui` equivalent), with the fixed read-write [`TEST_TOKEN`].
 pub async fn start_gateway_no_web_ui(socket_path: PathBuf) -> GatewayHandle {

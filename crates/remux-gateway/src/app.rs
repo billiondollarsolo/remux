@@ -110,6 +110,8 @@ struct AuthContext {
     subject: String,
     roles: String,
     token_id: String,
+    /// The auth method that produced the principal (`"static"` / `"jwt"`).
+    method: &'static str,
 }
 
 /// Build the full router with auth + the `/v1` surface.
@@ -221,8 +223,11 @@ async fn enforce_permission(
     next: Next,
 ) -> Response {
     let presented = extract_token(request.headers(), request.uri().query());
-    let principal: Principal = match presented.as_deref().and_then(|t| state.auth.resolve(t)) {
-        Some(p) => p.clone(),
+    let (principal, method): (Principal, &'static str) = match presented
+        .as_deref()
+        .and_then(|t| state.auth.authenticate(t))
+    {
+        Some((p, m)) => (p, m.as_str()),
         None => {
             let body =
                 json!({ "error": "missing or invalid bearer token", "kind": "unauthorized" });
@@ -245,6 +250,7 @@ async fn enforce_permission(
         subject: principal.subject.clone(),
         roles: principal.roles_display(),
         token_id,
+        method,
     };
     request.extensions_mut().insert(ctx.clone());
     let mut response = next.run(request).await;
@@ -284,12 +290,18 @@ async fn audit_layer(request: Request, next: Next) -> Response {
 
     // The auth context (if any) was inserted by the permission middleware; for
     // public or rejected requests it is absent → anonymous.
-    let (subject, roles, token_id) = match response.extensions().get::<AuthContext>() {
-        Some(ctx) => (ctx.subject.clone(), ctx.roles.clone(), ctx.token_id.clone()),
+    let (subject, roles, token_id, auth_method) = match response.extensions().get::<AuthContext>() {
+        Some(ctx) => (
+            ctx.subject.clone(),
+            ctx.roles.clone(),
+            ctx.token_id.clone(),
+            ctx.method,
+        ),
         None => (
             "anonymous".to_string(),
             String::new(),
             "anonymous".to_string(),
+            "none",
         ),
     };
 
@@ -300,6 +312,7 @@ async fn audit_layer(request: Request, next: Next) -> Response {
         status = response.status().as_u16(),
         subject = %subject,
         roles = %roles,
+        auth_method = %auth_method,
         token_id = %token_id,
         remote = %remote,
         latency_ms = format!("{latency_ms:.2}"),

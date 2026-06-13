@@ -735,13 +735,55 @@ model.
   lacking the route's permission → `403`. Audit lines now carry the principal's
   `subject` + `roles` alongside the hashed `token_id` (never the raw token).
 
-### 6.4 Deferred to the remaining hardening phases (B/C)
+### 6.3a Auth hardening Phase B — OIDC/JWT bearer ✅ **SHIPPED**
 
-OIDC / JWT (Phase B) and mTLS + gateway-cert pinning / CA trust (Phase C),
-per-org/team policy, short-lived credentials, and full audit pipelines remain
-**deferred**. They are now *additive*: each is simply another way to produce a
-`remux_authz::Principal`; the `Policy`/`permits` decision and the audit shape are
-unchanged. (`spec.md` §11 "Fleet: RBAC, audit logs".)
+A JWT (e.g. from an OIDC provider) can now be used as the bearer credential. It
+is validated and its claims are mapped to a `remux_authz::Principal`, so a
+JWT-authenticated caller flows through the **exact same** RBAC enforcement as a
+static token. Static tokens keep working unchanged.
+
+- **`remux_authz::jwt`** — a pure, offline-testable `JwtValidator` built on the
+  `jsonwebtoken` crate (the `aws_lc_rs` backend, sharing rustls' provider — no
+  RustCrypto stack pulled in). `JwtConfig { issuer?, audience?, roles_claim
+  (default "roles"), subject_claim (default "sub"), key }` where `JwtKey` is one
+  of `Hs256(secret)`, `Rs256(pem)` / `Es256(pem)` (static public key), or
+  `Jwks(set)` (a parsed `kid → key` map). `validate()` verifies the signature +
+  `exp` (+ `iss`/`aud` when configured, leeway 0) and builds `Principal { subject
+  ← subject_claim, roles ← roles_claim }`. The **roles claim accepts either** a
+  JSON array of strings **or** a space-delimited string (OIDC `scope` style).
+  Unknown/extra claims are ignored; any failure (expired, wrong iss/aud, bad
+  signature, missing subject) is a clear `JwtError` the caller maps to `401`.
+  `remux-authz` only *consumes* parsed keys — `parse_jwks()` turns a JWKS JSON
+  document into the `Jwks` set; **no HTTP client** is pulled into the pure crate.
+- **Service wiring** (gateway + control plane, shared in
+  `remux_gateway::jwt_service`): auth resolution is **static-then-JWT** — the
+  presented bearer is tried against the constant-time `TokenStore` FIRST; only on
+  a miss, and only if JWT is configured, is it validated as a JWT. Whichever
+  yields a `Principal` proceeds to the identical `permits()` check (a valid JWT
+  whose roles lack the route permission → `403`, same as static). Flags/env on
+  both services: `--jwt-hs256-secret`, `--jwt-public-key <PEM>` (static
+  RS256/ES256, offline-friendly), `--jwt-jwks-url <URL>` (fetched over HTTPS with
+  the existing `reqwest`, system roots, cached in-memory and refreshed on a TTL;
+  on a refresh failure the last good JWKS keeps serving, logged), plus
+  `--jwt-issuer`, `--jwt-audience`, `--jwt-roles-claim`. With **no** JWT flag set,
+  behavior is exactly as before (static tokens only). The audit line now records
+  the auth method (`static` vs `jwt`) alongside subject/roles (never the token).
+- **Tested:** `remux-authz` JWT unit tests (HS256 array + space-delimited scope,
+  RS256 with a generated keypair, JWKS-by-`kid`, expired / wrong-iss / wrong-aud /
+  tampered-signature / missing-subject errors, JWKS parsing); `jwt_service` unit
+  tests (settings → validator, HS256 end-to-end, mutually-exclusive key sources);
+  gateway `tests/jwt_e2e.rs` (operator JWT read+write, viewer JWT 200-read /
+  403-write, expired+garbage → 401, static token still works); control-plane
+  `tests/jwt_e2e.rs` (a `fleet-viewer` JWT lists hosts but is `403` on resolve, a
+  `fleet-admin` JWT clears the resolve gate, static admin token unaffected).
+
+### 6.4 Deferred to the remaining hardening phase (C)
+
+mTLS + gateway-cert pinning / CA trust (Phase C), per-org/team policy,
+short-lived credentials, and full audit pipelines remain **deferred**. They are
+*additive*: each is simply another way to produce a `remux_authz::Principal`; the
+`Policy`/`permits` decision and the audit shape are unchanged. (`spec.md` §11
+"Fleet: RBAC, audit logs".)
 
 ### 6.4 Tests
 
@@ -795,10 +837,16 @@ unchanged. (`spec.md` §11 "Fleet: RBAC, audit logs".)
       401-vs-403 semantics preserved; audit lines extended with subject + roles.
       Tested in `remux-authz` unit tests, `tests/scopes_e2e.rs`, and
       `tests/federation_e2e.rs`.
-- [x] OIDC/JWT (Phase B) and mTLS + cert-pinning (Phase C) documented as the
-      remaining deferred work (§6.4). They are additive: each produces a
-      `remux_authz::Principal` and reuses the shipped `Policy`/`permits` decision
-      and audit shape unchanged.
+- [x] **OIDC/JWT (Phase B) — SHIPPED** (§6.3a): a JWT bearer is validated by the
+      pure `remux_authz::jwt::JwtValidator` (HS256 / static RS256-ES256 PEM /
+      JWKS) and its claims (subject + array-or-scope roles) map to a `Principal`;
+      the services try the static `TokenStore` first, then JWT, with the identical
+      `permits()` decision and 401/403 semantics. Tested in `remux-authz` unit
+      tests, `jwt_service` unit tests, and the gateway + control-plane
+      `tests/jwt_e2e.rs`.
+- [x] mTLS + cert-pinning (Phase C) documented as the remaining deferred work
+      (§6.4). It is additive: it produces a `remux_authz::Principal` and reuses the
+      shipped `Policy`/`permits` decision and audit shape unchanged.
 
 ---
 

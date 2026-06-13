@@ -177,6 +177,56 @@ pub async fn start_control_plane_with_auth_config() -> (ControlPlaneHandle, Stri
     )
 }
 
+/// The HS256 shared secret the CP JWT e2e test mints + validates with.
+pub const CP_JWT_HS256_SECRET: &str = "cp-test-jwt-hs256-secret-0123456789ab";
+
+/// Start the control plane with the back-compat tokens PLUS a JWT/OIDC HS256
+/// validator using [`CP_JWT_HS256_SECRET`]. Static tokens still work; a JWT
+/// signed with the secret authenticates via the same RBAC roles.
+pub async fn start_control_plane_with_jwt() -> ControlPlaneHandle {
+    use remux_gateway::jwt_service::{JwtAuth, JwtSettings};
+    ensure_crypto_provider();
+    let tls = CpTls::generate_self_signed().expect("cp self-signed cert");
+    let rustls_config = tls.into_rustls_config().await.expect("cp rustls config");
+    let (listener, addr) =
+        remux_control_plane::server::bind_listener("127.0.0.1:0".parse().unwrap())
+            .expect("bind control-plane port");
+    let settings = JwtSettings {
+        hs256_secret: Some(CP_JWT_HS256_SECRET.to_string()),
+        ..Default::default()
+    };
+    let jwt = JwtAuth::from_settings(&settings)
+        .await
+        .expect("build jwt auth")
+        .expect("jwt enabled");
+    let auth = CpAuth::new(ADMIN_TOKEN.to_string(), REGISTER_TOKEN.to_string()).with_jwt(Some(jwt));
+    let state = CpState::new(auth)
+        .with_gateway_tls_insecure(true)
+        .with_gateway_timeout(Duration::from_secs(3));
+    tokio::spawn(async move {
+        let _ = remux_control_plane::server::serve(listener, rustls_config, state).await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    ControlPlaneHandle {
+        addr,
+        base_url: format!("https://{addr}"),
+    }
+}
+
+/// Mint an HS256 JWT signed with [`CP_JWT_HS256_SECRET`] (`sub` + a `roles`
+/// array), valid for one hour.
+pub fn mint_cp_jwt(sub: &str, roles: &[&str]) -> String {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    let exp = jsonwebtoken::get_current_timestamp() as i64 + 3600;
+    let claims = serde_json::json!({ "sub": sub, "roles": roles, "exp": exp });
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(CP_JWT_HS256_SECRET.as_bytes()),
+    )
+    .expect("mint cp test JWT")
+}
+
 /// A reqwest client that accepts self-signed certs (the gateways and CP use them).
 pub fn client() -> reqwest::Client {
     reqwest::Client::builder()

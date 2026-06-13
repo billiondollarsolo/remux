@@ -12,6 +12,7 @@ path = "src/lib.rs"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "1"
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["aws_lc_rs", "pem", "use_pem"] }
+serde_json = "1"
 
 [dev-dependencies]
-serde_json = "1"

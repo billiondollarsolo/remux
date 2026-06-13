@@ -21,6 +21,7 @@ pub use remux_authz::{
     audit_id_for, bearer_from_header, load_auth_config, permits, AuthConfigError, Permission,
     Policy, Principal, TokenStore,
 };
+pub use remux_gateway::jwt_service::{AuthMethod, JwtAuth};
 
 /// The control plane's resolved auth state: the token→principal store and the
 /// policy its principals' roles are evaluated against. Cheap to clone.
@@ -32,6 +33,8 @@ pub struct AuthConfig {
 struct AuthInner {
     store: TokenStore,
     policy: Policy,
+    /// Phase B: an optional JWT/OIDC validator (the shared service-side wiring).
+    jwt: Option<JwtAuth>,
 }
 
 impl AuthConfig {
@@ -53,7 +56,11 @@ impl AuthConfig {
             );
         }
         Self {
-            inner: Arc::new(AuthInner { store, policy }),
+            inner: Arc::new(AuthInner {
+                store,
+                policy,
+                jwt: None,
+            }),
         }
     }
 
@@ -79,15 +86,47 @@ impl AuthConfig {
             inner: Arc::new(AuthInner {
                 store,
                 policy: file_policy,
+                jwt: None,
             }),
         })
     }
 
-    /// Resolve a presented bearer token to its [`Principal`] (constant-time), or
-    /// `None` if it matches no configured token (the caller turns that into a
-    /// `401`).
+    /// Attach a JWT/OIDC validator (Phase B). A presented bearer that misses the
+    /// static [`TokenStore`] is then tried as a JWT.
+    pub fn with_jwt(self, jwt: Option<JwtAuth>) -> Self {
+        let inner = self.inner;
+        Self {
+            inner: Arc::new(AuthInner {
+                store: inner.store.clone(),
+                policy: inner.policy.clone(),
+                jwt,
+            }),
+        }
+    }
+
+    /// Resolve a presented bearer token to its [`Principal`] (constant-time),
+    /// **static tokens only**. [`AuthConfig::authenticate`] is the full
+    /// static-then-JWT resolution.
     pub fn resolve(&self, presented: &str) -> Option<&Principal> {
         self.inner.store.resolve(presented)
+    }
+
+    /// Resolve a presented bearer to a [`Principal`] and the [`AuthMethod`] that
+    /// produced it: the static [`TokenStore`] FIRST, then (if configured) JWT.
+    /// `None` means neither matched (caller → `401`).
+    pub fn authenticate(&self, presented: &str) -> Option<(Principal, AuthMethod)> {
+        if let Some(p) = self.inner.store.resolve(presented) {
+            return Some((p.clone(), AuthMethod::Static));
+        }
+        if let Some(jwt) = &self.inner.jwt {
+            match jwt.validate(presented) {
+                Ok(p) => return Some((p, AuthMethod::Jwt)),
+                Err(e) => {
+                    tracing::debug!(error = %e, "JWT validation failed for presented bearer");
+                }
+            }
+        }
+        None
     }
 
     /// Whether `principal` may exercise `perm` under this config's policy.

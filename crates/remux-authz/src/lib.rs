@@ -20,17 +20,26 @@
 //! - [`load_auth_config`] — parse the shared TOML auth-config into a merged
 //!   [`Policy`] and the token→principal pairs.
 //!
-//! **Designed for the later phases:** Phase B (OIDC/JWT) and Phase C (mTLS +
-//! cert pinning) plug in as *additional* ways to produce a [`Principal`]; the
-//! [`Policy`]/[`permits`] decision and the audit shape are unchanged.
+//! Phase B (OIDC/JWT) — [`JwtValidator`] in [`jwt`] — adds a second, additive way
+//! to produce a [`Principal`]: validate a JWT (HS256 / static RS256-ES256 PEM /
+//! parsed JWKS) and map its claims (subject + array-or-`scope` roles). It is pure
+//! and offline (`parse_jwks` consumes an already-fetched JWKS; no HTTP client
+//! here). The services try the [`TokenStore`] first, then the validator, and feed
+//! the resulting [`Principal`] through the **same** [`Policy`]/[`permits`]
+//! decision and audit shape.
+//!
+//! **Designed for the later phase:** Phase C (mTLS + cert pinning) plugs in the
+//! same way — another way to produce a [`Principal`], decision/audit unchanged.
 
 mod config;
+mod jwt;
 mod permission;
 mod policy;
 mod principal;
 mod token_store;
 
 pub use config::{load_auth_config, AuthConfigError, AuthConfigFile, RoleEntry, TokenEntry};
+pub use jwt::{parse_jwks, Jwks, JwtConfig, JwtError, JwtKey, JwtValidator};
 pub use permission::{ParsePermissionError, Permission};
 pub use policy::{builtin_roles, Policy, Role};
 pub use principal::{permits, Authorizer, Principal};

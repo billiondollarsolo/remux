@@ -340,6 +340,56 @@ permissions = ["session.create", "session.input", "session.read"]
 A `deployer` token above can create + input + read, but **not** kill (it lacks
 `session.kill`).
 
+#### JWT / OIDC bearer (Phase B)
+
+A **JWT** (e.g. from an OIDC provider) can be used as the bearer credential
+instead of — or alongside — static tokens. The gateway validates the token and
+maps its claims to a principal, so **JWT callers use the exact same RBAC roles
+and the same 401/403 semantics** as static tokens. Static tokens keep working
+unchanged; if no JWT flag is set, behaviour is exactly as before.
+
+Resolution order: a presented bearer is checked against the static tokens
+**first** (constant time); only on a miss is it validated as a JWT. A JWT that
+validates but whose roles lack the route's permission is `403` (same as static);
+an expired / wrong-issuer / wrong-audience / bad-signature / unknown token is
+`401`.
+
+Pick **one** key source:
+
+| Flag (env) | Key source |
+| --- | --- |
+| `--jwt-hs256-secret` (`REMUX_GATEWAY_JWT_HS256_SECRET`) | HS256 shared secret (symmetric) |
+| `--jwt-public-key <PEM>` (`REMUX_GATEWAY_JWT_PUBLIC_KEY`) | a static RS256/ES256 public-key PEM file (offline-friendly) |
+| `--jwt-jwks-url <URL>` (`REMUX_GATEWAY_JWT_JWKS_URL`) | a JWKS endpoint fetched over HTTPS, cached in-memory and refreshed on a TTL |
+
+Plus the optional claim configuration (env equivalents
+`REMUX_GATEWAY_JWT_ISSUER` / `_AUDIENCE` / `_ROLES_CLAIM`):
+
+- `--jwt-issuer <ISS>` — require this `iss` (otherwise `iss` is not checked).
+- `--jwt-audience <AUD>` — require this `aud` (otherwise `aud` is not checked).
+- `--jwt-roles-claim <CLAIM>` — the claim to read roles from (default `roles`).
+  The claim may be a **JSON array of strings** *or* a **space-delimited string**
+  (OIDC `scope` style), so `"roles":["operator"]` and `"scope":"viewer operator"`
+  both work. The subject defaults to the `sub` claim.
+- `--jwt-jwks-ttl <SECS>` (default 300) and `--jwt-jwks-tls-insecure` tune the
+  JWKS-URL path; on a refresh failure the last good key set keeps serving.
+
+```sh
+# HS256, mapping the token's `roles` claim to gateway RBAC roles:
+remux-gateway --listen 0.0.0.0:8443 \
+  --token "$RW_TOKEN" \
+  --jwt-hs256-secret "$JWT_SECRET" \
+  --jwt-issuer https://idp.example/ --jwt-audience remux
+
+# Or an OIDC provider's JWKS (RS256/ES256), reading roles from `scope`:
+remux-gateway --jwt-jwks-url https://idp.example/.well-known/jwks.json \
+  --jwt-issuer https://idp.example/ --jwt-roles-claim scope
+```
+
+The audit line records the auth method (`static` vs `jwt`) alongside the
+principal's subject and roles (never the token). The control plane takes the same
+`--jwt-*` flags (env prefix `REMUX_CP_JWT_*`) for its `/cp/v1` fleet API.
+
 ### Auto-join a control plane (`--register`)
 
 A gateway can **register itself** with a [control plane](#control-plane-fleet-federation)

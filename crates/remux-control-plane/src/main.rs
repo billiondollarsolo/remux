@@ -17,6 +17,7 @@ use clap::Parser;
 use remux_control_plane::app::AppState;
 use remux_control_plane::auth::AuthConfig;
 use remux_control_plane::tls::TlsMaterial;
+use remux_gateway::jwt_service::{JwtAuth, JwtSettings};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -44,6 +45,44 @@ struct Cli {
     /// `REMUX_CP_AUTH_CONFIG`.
     #[arg(long, value_name = "FILE", env = "REMUX_CP_AUTH_CONFIG")]
     auth_config: Option<PathBuf>,
+
+    // --- Phase B: JWT/OIDC bearer authentication ---
+    // A JWT that validates maps its claims to a Principal and flows through the
+    // SAME RBAC roles as a static token. At most one key source may be set.
+    /// JWT HS256 shared secret. Falls back to `REMUX_CP_JWT_HS256_SECRET`.
+    #[arg(long, value_name = "SECRET", env = "REMUX_CP_JWT_HS256_SECRET")]
+    jwt_hs256_secret: Option<String>,
+
+    /// JWT static public-key PEM file (RS256/ES256). Falls back to
+    /// `REMUX_CP_JWT_PUBLIC_KEY`.
+    #[arg(long, value_name = "PEM_FILE", env = "REMUX_CP_JWT_PUBLIC_KEY")]
+    jwt_public_key: Option<PathBuf>,
+
+    /// JWKS URL to fetch over HTTPS and cache (RS256/ES256). Falls back to
+    /// `REMUX_CP_JWT_JWKS_URL`.
+    #[arg(long, value_name = "URL", env = "REMUX_CP_JWT_JWKS_URL")]
+    jwt_jwks_url: Option<String>,
+
+    /// JWKS refresh TTL in seconds (default 300).
+    #[arg(long, default_value = "300")]
+    jwt_jwks_ttl: u64,
+
+    /// Accept self-signed/invalid TLS certs when fetching the JWKS URL.
+    #[arg(long, default_value = "false")]
+    jwt_jwks_tls_insecure: bool,
+
+    /// Required JWT issuer (`iss`). Falls back to `REMUX_CP_JWT_ISSUER`.
+    #[arg(long, value_name = "ISS", env = "REMUX_CP_JWT_ISSUER")]
+    jwt_issuer: Option<String>,
+
+    /// Required JWT audience (`aud`). Falls back to `REMUX_CP_JWT_AUDIENCE`.
+    #[arg(long, value_name = "AUD", env = "REMUX_CP_JWT_AUDIENCE")]
+    jwt_audience: Option<String>,
+
+    /// JWT claim to read roles from (default `roles`). Falls back to
+    /// `REMUX_CP_JWT_ROLES_CLAIM`.
+    #[arg(long, value_name = "CLAIM", env = "REMUX_CP_JWT_ROLES_CLAIM")]
+    jwt_roles_claim: Option<String>,
 
     /// TLS certificate (PEM). Must be paired with `--tls-key`. If both are
     /// omitted, a self-signed cert is generated for `127.0.0.1`/`localhost`.
@@ -109,6 +148,30 @@ async fn run(cli: Cli) -> Result<(), String> {
         cli.auth_config.as_deref(),
     )
     .map_err(|e| format!("auth config: {e}"))?;
+
+    // Phase B: optional JWT/OIDC validator (None → static tokens only, as before).
+    let jwt_settings = JwtSettings {
+        hs256_secret: cli.jwt_hs256_secret.clone(),
+        public_key_pem: cli.jwt_public_key.clone(),
+        jwks_url: cli.jwt_jwks_url.clone(),
+        issuer: cli.jwt_issuer.clone(),
+        audience: cli.jwt_audience.clone(),
+        roles_claim: cli.jwt_roles_claim.clone(),
+        jwks_ttl_secs: Some(cli.jwt_jwks_ttl),
+        jwks_tls_insecure: cli.jwt_jwks_tls_insecure,
+    };
+    let jwt = JwtAuth::from_settings(&jwt_settings)
+        .await
+        .map_err(|e| format!("jwt config: {e}"))?;
+    if jwt.is_some() {
+        tracing::info!(
+            issuer = cli.jwt_issuer.as_deref().unwrap_or("(any)"),
+            audience = cli.jwt_audience.as_deref().unwrap_or("(any)"),
+            roles_claim = cli.jwt_roles_claim.as_deref().unwrap_or("roles"),
+            "JWT/OIDC bearer auth enabled (static tokens tried first, then JWT; same RBAC roles)"
+        );
+    }
+    let auth = auth.with_jwt(jwt);
 
     // Resolve TLS material (operator PEM or self-signed for loopback).
     let tls = TlsMaterial::resolve(cli.tls_cert, cli.tls_key)?;
