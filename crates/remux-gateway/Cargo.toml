@@ -34,12 +34,14 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 futures-util = "0.3"
 utoipa = { version = "5", features = ["yaml", "chrono"] }
+# AW6: outbound auto-registration with the control plane.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [dev-dependencies]
 remux-testkit = { path = "../remux-testkit" }
+remux-control-plane = { path = "../remux-control-plane" }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"

@@ -42,3 +42,33 @@ pub async fn serve(
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
 }
+
+/// Serve the gateway over TLS, shutting down gracefully when `shutdown` resolves.
+///
+/// Used by the binary so a SIGTERM/SIGINT can trigger best-effort deregistration
+/// from the control plane before the process exits. The future drives
+/// `axum-server` via a [`axum_server::Handle`]; when `shutdown` resolves we ask
+/// the handle to stop accepting new connections.
+pub async fn serve_with_shutdown<F>(
+    listener: TcpListener,
+    tls: RustlsConfig,
+    state: AppState,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let app = router(state);
+    let handle = axum_server::Handle::new();
+    let handle_for_shutdown = handle.clone();
+    tokio::spawn(async move {
+        shutdown.await;
+        // Stop gracefully with a bounded drain window so in-flight requests can
+        // finish but a hung connection can't block shutdown forever.
+        handle_for_shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(3)));
+    });
+    axum_server::from_tcp_rustls(listener, tls)
+        .handle(handle)
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+}

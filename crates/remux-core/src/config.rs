@@ -13,6 +13,8 @@ pub struct Config {
     pub client: ClientConfig,
     #[serde(default)]
     pub fleet: FleetConfig,
+    #[serde(default)]
+    pub control_plane: ControlPlaneConfig,
 }
 
 impl Config {
@@ -142,6 +144,23 @@ pub struct FleetConfig {
     pub hosts: Vec<FleetHost>,
 }
 
+/// Control-plane (federation) client configuration for `remux open`.
+///
+/// When set, `remux open` drives the control plane's `POST /cp/v1/resolve`
+/// (intent routing) instead of requiring a `--control-plane` flag every time.
+/// Both fields are optional; the flag / environment variables override them.
+/// This is the **client-side** config for talking TO a control plane — the
+/// control-plane service itself is configured via its own CLI flags.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ControlPlaneConfig {
+    /// The control plane's base URL (e.g. `https://cp.internal:9443`).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// The admin bearer token `remux open` authenticates with.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
 /// A single registered fleet host.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FleetHost {
@@ -247,6 +266,28 @@ ssh = "ops@prod1.example.com"
         assert_eq!(prod.ssh, "ops@prod1.example.com");
         // Labels default to empty when the block omits them.
         assert!(prod.labels.is_empty());
+    }
+
+    #[test]
+    fn control_plane_absent_defaults_to_none() {
+        let config = Config::from_toml_str("").expect("parse empty");
+        assert!(config.control_plane.url.is_none());
+        assert!(config.control_plane.token.is_none());
+    }
+
+    #[test]
+    fn control_plane_parses_url_and_token() {
+        let toml = r#"
+[control_plane]
+url = "https://cp.internal:9443"
+token = "admin-secret"
+"#;
+        let config = Config::from_toml_str(toml).expect("parse control_plane");
+        assert_eq!(
+            config.control_plane.url.as_deref(),
+            Some("https://cp.internal:9443")
+        );
+        assert_eq!(config.control_plane.token.as_deref(), Some("admin-secret"));
     }
 
     #[test]

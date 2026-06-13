@@ -870,12 +870,42 @@ the API, not to *be* the product.
 >   TLS e2e test (two daemons + two in-process gateways + the control plane:
 >   `crates/remux-control-plane/tests/federation_e2e.rs`).
 >
-> **Still DEFERRED (the explicit NEXT steps):** gateway `--register`
-> auto-registration (today a gateway is registered by an external caller / the
-> e2e harness), the `remux open` CLI front-end for intent routing, **RBAC / OIDC
-> / mTLS** and principal-scoped tokens, **gateway-cert pinning / CA trust**, and
-> **cross-host session migration** + agent-ownership arbitration. §8.4 below is
-> updated accordingly.
+> **Self-running federation update (SHIPPED):** two pieces that make the
+> federation self-assembling and usable have now landed:
+> - **Gateway auto-registration** — `remux-gateway --register <CP_URL>` has the
+>   gateway register **itself** outbound on startup (`POST /cp/v1/register` with
+>   its own read-write bearer as the call-back token), then heartbeat every
+>   `ttl/2` (`--register-ttl`, default 30), and best-effort deregister
+>   (`DELETE /cp/v1/hosts/{name}`) on SIGTERM/SIGINT graceful shutdown. Flags:
+>   `--register-token` (env `REMUX_GATEWAY_REGISTER_TOKEN`), `--advertise-url`
+>   (default `https://<--listen>`), `--register-name` (default hostname),
+>   repeatable `--label k=v`, `--register-tls-insecure` (default `true`, trusts
+>   the CP's self-signed cert, logged as a warning). Registration failures are
+>   **never fatal** — logged and retried with bounded backoff while the `/v1` API
+>   keeps serving (`crates/remux-gateway/src/register.rs`; proven by
+>   `crates/remux-gateway/tests/register_e2e.rs`: a real daemon + real gateway
+>   auto-register into an in-process control plane and become healthy + reachable
+>   via fan-out).
+> - **`remux open` CLI (intent routing)** — `remux open` (alias `o`) drives
+>   `POST /cp/v1/resolve { labels, command?, reuse_name? }`, then **routes the
+>   caller**: if the resolved `host` is in the local `[[fleet.hosts]]` registry it
+>   attaches over SSH to the resolved session (reusing the `--host`/`fleet attach`
+>   remote-attach path); otherwise it prints the resolved target (human or
+>   `--json`) with a hint, exit 0. This is the elegant split — the **control
+>   plane** owns *intent → host/session*, the **local fleet registry** owns *host
+>   → SSH reachability*. `--control-plane`/`--token` fall back to a new
+>   `[control_plane]` config section (`remux_core::ControlPlaneConfig`), then
+>   `REMUX_CP_URL`/`REMUX_CP_TOKEN`. The resolve + target-decision + formatting
+>   are **pure** functions (`resolve_endpoint`/`decide_target`/`format_target`),
+>   unit-tested for created/reuse × in-fleet/not-in-fleet
+>   (`crates/remux-cli/src/cmd/open.rs`).
+>
+> **Still DEFERRED (the explicit NEXT steps):** **RBAC / OIDC / mTLS** and
+> principal-scoped tokens fleet-wide, **gateway-cert pinning / CA trust** (v1
+> still trusts self-signed certs via `--gateway-tls-insecure` /
+> `--register-tls-insecure`), a **cached fleet index** (fan-out is live per
+> request), and **cross-host session migration** + agent-ownership arbitration.
+> §8.4 below is updated accordingly.
 
 **Goal:** Sketch the layer that turns "one daemon, one host" into "one pane for
 humans **and** agents across a fleet." This is `spec.md` §10. We **design** it
@@ -929,13 +959,10 @@ The **client-side discovery slice** shipped first (static host registry,
 (register/heartbeat/deregister/list, health-tracked by TTL), the **federated
 fleet API** (`GET /cp/v1/sessions` concurrent gateway fan-out + label filtering +
 per-host error isolation), and **intent routing v1** (`POST /cp/v1/resolve`).
-What remains **future work**:
+**Gateway auto-registration** (`remux-gateway --register`) and the **`remux open`
+CLI** intent-routing front-end have now **SHIPPED** too (see the status note
+above). What remains **future work**:
 
-- **gateway auto-registration**: a gateway `--register <cp-url>` flag that has the
-  gateway register itself outbound on startup + heartbeat on a timer (today an
-  external caller performs the `POST /cp/v1/register`);
-- the **`remux open` CLI** front-end (`remux open --project api --env dev`) that
-  drives `POST /cp/v1/resolve` and then routes the caller to the session;
 - **RBAC / OIDC / mTLS**, multi-tenant isolation, and principal-scoped tokens
   fleet-wide (v1 ships two coarse static tokens: admin + register);
 - **gateway-cert pinning / CA trust** (v1 trusts self-signed gateway certs via

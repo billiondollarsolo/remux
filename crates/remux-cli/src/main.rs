@@ -169,6 +169,42 @@ enum Commands {
     /// Multi-host fleet discovery over SSH (client-side fan-out, no control plane)
     #[command(visible_alias = "f", subcommand)]
     Fleet(FleetCommands),
+    /// Resolve an intent against the control plane and attach (intent routing).
+    ///
+    /// Asks the control plane (`POST /cp/v1/resolve`) which host + session
+    /// satisfies the given labels (reusing or creating one), then attaches over
+    /// SSH if the resolved host is in your local `[[fleet.hosts]]` registry; else
+    /// prints the resolved target. The CP decides intent; the local fleet
+    /// registry knows how to reach the host.
+    #[command(visible_alias = "o")]
+    Open {
+        /// Control plane base URL. Falls back to `[control_plane].url`, then
+        /// `REMUX_CP_URL`.
+        #[arg(long = "control-plane", value_name = "URL")]
+        control_plane: Option<String>,
+        /// Admin bearer token. Falls back to `[control_plane].token`, then
+        /// `REMUX_CP_TOKEN`.
+        #[arg(long, value_name = "TOK")]
+        token: Option<String>,
+        /// Selector label `key=value` (repeatable; matches ALL given labels).
+        #[arg(long = "label", value_name = "k=v")]
+        labels: Vec<String>,
+        /// Reuse an existing session of this name on the resolved host if present.
+        #[arg(long, value_name = "NAME")]
+        reuse: Option<String>,
+        /// Attach read-only (Observer) once routed.
+        #[arg(long)]
+        read_only: bool,
+        /// Emit the resolved target as JSON (print-only branch).
+        #[arg(long)]
+        json: bool,
+        /// Command to create a new session with if none exists (trailing args).
+        #[arg(long = "command", value_name = "CMD")]
+        command_flag: Option<String>,
+        /// Trailing command args (alternative to repeated --command).
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
     /// Internal: pipe the protocol between stdin/stdout and the local daemon
     /// socket. Run on a remote host via `ssh <host> remux bridge` to back the
     /// `--host` remote transport. Not intended for direct use.
@@ -284,6 +320,35 @@ async fn main() {
     // Handle it before the local/remote client connection below.
     if let Commands::Fleet(fleet_cmd) = cli.command {
         run_fleet(fleet_cmd, &config).await;
+        return;
+    }
+
+    // `open` routes via the control plane (HTTP) and then attaches over SSH; it
+    // never touches the local daemon socket directly, so handle it before the
+    // local/remote client connection below.
+    if let Commands::Open {
+        control_plane,
+        token,
+        labels,
+        reuse,
+        read_only,
+        json,
+        command_flag,
+        command,
+    } = cli.command
+    {
+        run_open(
+            &config,
+            control_plane,
+            token,
+            labels,
+            reuse,
+            read_only,
+            json,
+            command_flag,
+            command,
+        )
+        .await;
         return;
     }
 
@@ -428,6 +493,7 @@ async fn main() {
         Commands::Completions { .. } => unreachable!("completions handled early"),
         Commands::Bridge => unreachable!("bridge handled early"),
         Commands::Fleet(_) => unreachable!("fleet handled early"),
+        Commands::Open { .. } => unreachable!("open handled early"),
     };
 
     if let Err(e) = result {
@@ -501,5 +567,75 @@ async fn run_fleet(cmd: FleetCommands, config: &Config) {
                 process::exit(exit::exit_code_for(&e));
             }
         }
+    }
+}
+
+/// Run `remux open`: resolve the intent against the control plane, then attach
+/// over SSH (host in the local fleet) or print the resolved target. Dispatched
+/// before the local daemon connection since it routes via HTTP + SSH.
+#[allow(clippy::too_many_arguments)]
+async fn run_open(
+    config: &Config,
+    control_plane: Option<String>,
+    token: Option<String>,
+    labels: Vec<String>,
+    reuse: Option<String>,
+    read_only: bool,
+    json: bool,
+    command_flag: Option<String>,
+    command: Vec<String>,
+) {
+    use std::collections::BTreeMap;
+
+    // Resolve the control-plane endpoint (flag -> config -> env).
+    let endpoint = match cmd::open::resolve_endpoint(
+        control_plane,
+        token,
+        config,
+        std::env::var("REMUX_CP_URL").ok(),
+        std::env::var("REMUX_CP_TOKEN").ok(),
+    ) {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    };
+
+    // Parse `--label k=v` selectors up front so a bad one fails clearly.
+    let mut selectors: BTreeMap<String, String> = BTreeMap::new();
+    for l in &labels {
+        match cmd::fleet::parse_label(l) {
+            Ok((k, v)) => {
+                selectors.insert(k, v);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                process::exit(1);
+            }
+        }
+    }
+
+    // The command to create a new session with, if the CP has to create one.
+    // `--command "<cmd>"` is split on whitespace; trailing args are taken as-is.
+    let command_vec: Vec<String> = if let Some(c) = command_flag {
+        c.split_whitespace().map(|s| s.to_string()).collect()
+    } else {
+        command
+    };
+
+    if let Err(e) = cmd::open::run(
+        config,
+        endpoint,
+        selectors,
+        command_vec,
+        reuse,
+        json,
+        read_only,
+    )
+    .await
+    {
+        eprintln!("error: {e}");
+        process::exit(exit::exit_code_for(&e));
     }
 }

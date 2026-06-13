@@ -302,6 +302,38 @@ remux-gateway --listen 0.0.0.0:8443 \
   otherwise; `401` for an unknown token). Every request is audit-logged
   (method, path, status, scope, hashed token id, peer, latency — never the raw token).
 
+### Auto-join a control plane (`--register`)
+
+A gateway can **register itself** with a [control plane](#control-plane-fleet-federation)
+on startup so the fleet is self-assembling — no external caller has to POST the
+registration. It dials **outbound** to the control plane (the daemon still never
+listens on a network port) and keeps the registration fresh with a background
+heartbeat.
+
+```sh
+remux-gateway --listen 0.0.0.0:8443 --token "$RW_TOKEN" \
+  --register https://cp.internal:9443 \
+  --register-token "$REGISTER_TOKEN" \
+  --advertise-url https://10.0.0.4:8443 \
+  --register-name web-1 --label env=dev --label region=us
+```
+
+- `--register <CP_URL>` turns it on; `--register-token`/`REMUX_GATEWAY_REGISTER_TOKEN`
+  is the control plane's register token.
+- `--advertise-url <URL>` is the gateway's externally-reachable base URL the
+  control plane dials back (defaults to `https://<--listen>` — set it explicitly
+  when binding a wildcard address). The gateway hands the control plane its own
+  read-write `--token` so the CP can call its `/v1` API.
+- `--register-name <NAME>` defaults to the system hostname; `--label k=v` is
+  repeatable (used for fan-out / intent routing); `--register-ttl <SECS>`
+  (default 30) sets the registration TTL — the heartbeat runs every `ttl/2`.
+- On startup the gateway POSTs `/cp/v1/register`, then heartbeats; on
+  SIGTERM/SIGINT it best-effort `DELETE`s `/cp/v1/hosts/{name}`. Registration
+  failures **never crash the gateway** — they're logged and retried with bounded
+  backoff while the `/v1` API keeps serving.
+- `--register-tls-insecure` (default **true** for v1) trusts the control plane's
+  self-signed cert; pinning is the deferred follow-up.
+
 ### REST endpoints
 
 ```
@@ -394,8 +426,38 @@ POST   /cp/v1/resolve                  # intent routing: {labels,command?,reuse_
   else creates one via that gateway's `POST /v1/sessions`, responding
   `{ host, gateway_url, session_id, name, created }`.
 
-Gateway `--register` auto-registration, the `remux open` CLI front-end, and
-RBAC/OIDC/mTLS with cross-host migration are the explicitly-deferred next steps.
+### `remux open` — intent routing
+
+`remux open` is the human/agent front-end for the control plane's `resolve`
+endpoint. You describe **intent** (labels); the control plane decides **which**
+host and session satisfies it (reusing a live one or creating a new one); then
+the CLI **attaches** if it knows how to reach that host.
+
+```sh
+remux open --control-plane https://cp.internal:9443 --token "$ADMIN_TOKEN" \
+  --label project=api --label env=dev --reuse api-shell -- /bin/bash
+remux o --label env=dev          # alias `o`; --control-plane/--token fall back to config/env
+remux open --label env=dev --json   # print-only branch as JSON
+```
+
+- `--control-plane <URL>` / `--token <TOK>` fall back to the `[control_plane]`
+  config section, then the `REMUX_CP_URL` / `REMUX_CP_TOKEN` environment
+  variables.
+- `--label k=v` (repeatable) selects the host; `--reuse <name>` reuses an
+  existing same-named session if present; a trailing `--command`/command is what
+  the control plane creates if none exists.
+- **The split:** the control plane returns `{ host, gateway_url, session_id,
+  name, created }`. If that `host` is in your local `[[fleet.hosts]]` registry
+  with an `ssh` target, `remux open` attaches over SSH to the resolved session
+  (the same remote-attach path as `--host`/`fleet attach`). If the host isn't in
+  your local registry, it **doesn't fail** — it prints the resolved target (or
+  JSON with `--json`) and hints that adding the host to `[[fleet.hosts]]` enables
+  auto-attach, or that the gateway's browser UI can be used. So the control plane
+  owns *intent → host/session*, and the local fleet registry owns *host → SSH
+  reachability*.
+
+RBAC/OIDC/mTLS, gateway-cert pinning, and cross-host migration remain the
+explicitly-deferred next steps.
 
 ## Configuration
 
@@ -421,6 +483,12 @@ dir = "/home/user/.local/share/remux"               # default: dirs::data_dir()/
 name = "devbox"                                     # logical name (fleet attach devbox:...)
 ssh = "user@devbox"                                 # ssh target
 labels = { project = "api", env = "dev" }           # filter with `fleet ls --label k=v`
+
+# Optional control-plane endpoint for `remux open` (intent routing). The flag
+# (--control-plane/--token) and REMUX_CP_URL/REMUX_CP_TOKEN envs override these.
+[control_plane]
+url = "https://cp.internal:9443"                    # control-plane base URL
+token = "admin-token"                               # admin bearer token
 ```
 
 ### Paths

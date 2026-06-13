@@ -39,6 +39,7 @@ pub mod app;
 pub mod auth;
 pub mod daemon_conn;
 pub mod error;
+pub mod register;
 pub mod selector;
 pub mod server;
 pub mod tls;

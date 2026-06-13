@@ -7,6 +7,7 @@
 //! loopback and a random bearer token (logged jupyter-style) so it works with no
 //! configuration. TLS is always on.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -15,6 +16,7 @@ use clap::Parser;
 use remux_core::Config;
 use remux_gateway::app::AppState;
 use remux_gateway::auth::AuthConfig;
+use remux_gateway::register::RegisterConfig;
 use remux_gateway::tls::TlsMaterial;
 
 #[derive(Debug, Parser)]
@@ -58,6 +60,80 @@ struct Cli {
     /// served by default.
     #[arg(long)]
     no_web_ui: bool,
+
+    /// AW6: auto-register this gateway with a control plane at `<CP_URL>` on
+    /// startup, then heartbeat on a timer and best-effort deregister on
+    /// shutdown. When unset, no registration happens.
+    #[arg(long, value_name = "CP_URL")]
+    register: Option<String>,
+
+    /// The register-token the control plane authenticates this gateway's
+    /// registration with. Falls back to `REMUX_GATEWAY_REGISTER_TOKEN`.
+    #[arg(long, env = "REMUX_GATEWAY_REGISTER_TOKEN")]
+    register_token: Option<String>,
+
+    /// The gateway's externally-reachable base URL the control plane dials back
+    /// (e.g. `https://10.0.0.4:8443`). Defaults to `https://<--listen>`.
+    #[arg(long, value_name = "URL")]
+    advertise_url: Option<String>,
+
+    /// The logical host name to register under. Defaults to the system hostname.
+    #[arg(long, value_name = "NAME")]
+    register_name: Option<String>,
+
+    /// Selector label `key=value` to register with (repeatable). Used by the
+    /// control plane for fan-out / intent routing.
+    #[arg(long = "label", value_name = "k=v")]
+    labels: Vec<String>,
+
+    /// Registration TTL in seconds; the heartbeat runs every `ttl/2`.
+    #[arg(long, default_value = "30")]
+    register_ttl: u64,
+
+    /// Accept self-signed/invalid control-plane certs when registering (v1
+    /// default `true`, since the control plane defaults to a self-signed cert).
+    /// Cert pinning is the deferred follow-up.
+    #[arg(long, default_value = "true")]
+    register_tls_insecure: bool,
+}
+
+/// Parse a `--label key=value` argument into a `(key, value)` pair.
+fn parse_label(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
+        _ => Err(format!("invalid --label {s:?} (expected key=value)")),
+    }
+}
+
+/// The default `advertise_url` derived from the `--listen` address: an HTTPS URL
+/// at that host/port. A wildcard bind (`0.0.0.0`/`::`) can't be dialed back, so
+/// this is only a fallback — operators with a wildcard bind should pass
+/// `--advertise-url` explicitly.
+fn default_advertise_url(listen: SocketAddr) -> String {
+    format!("https://{listen}")
+}
+
+/// Resolve the host name to register under: the flag, else the system hostname,
+/// else a stable fallback.
+fn resolve_register_name(flag: Option<String>) -> String {
+    if let Some(name) = flag.filter(|n| !n.is_empty()) {
+        return name;
+    }
+    hostname_or_fallback()
+}
+
+/// Read the system hostname, falling back to `"remux-gateway"` if unavailable.
+fn hostname_or_fallback() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "remux-gateway".to_string())
 }
 
 fn resolve_socket_path(flag: Option<PathBuf>) -> PathBuf {
@@ -171,7 +247,102 @@ async fn run(cli: Cli) -> Result<(), String> {
 
     let state = AppState::new(socket_path, auth).with_web_ui(!cli.no_web_ui);
 
-    remux_gateway::server::serve(listener, rustls_config, state)
-        .await
-        .map_err(|e| format!("server error: {e}"))
+    // AW6: optional outbound auto-registration with a control plane. A shutdown
+    // watch channel lets a SIGTERM/SIGINT signal both the server (graceful stop)
+    // and the registration task (best-effort deregister) at once.
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+    if let Some(cp_url) = cli.register.clone() {
+        let register_token = cli
+            .register_token
+            .clone()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_default();
+        if register_token.is_empty() {
+            tracing::warn!(
+                "--register set without a register token \
+                 (--register-token/REMUX_GATEWAY_REGISTER_TOKEN); registration will likely be rejected"
+            );
+        }
+        let mut labels = BTreeMap::new();
+        for l in &cli.labels {
+            match parse_label(l) {
+                Ok((k, v)) => {
+                    labels.insert(k, v);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let advertise_url = cli
+            .advertise_url
+            .clone()
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| default_advertise_url(addr));
+        let name = resolve_register_name(cli.register_name.clone());
+        tracing::info!(
+            cp_url = %cp_url,
+            name = %name,
+            advertise_url = %advertise_url,
+            ttl_secs = cli.register_ttl,
+            "auto-registering with the control plane (outbound; daemon stays Unix-socket-only)"
+        );
+        let reg_cfg = RegisterConfig {
+            cp_url,
+            register_token,
+            advertise_url,
+            name,
+            labels,
+            // The gateway advertises its OWN read-write bearer so the CP can
+            // call back into its /v1 API.
+            gateway_token: token.clone(),
+            ttl_secs: cli.register_ttl,
+            tls_insecure: cli.register_tls_insecure,
+        };
+        remux_gateway::register::spawn(reg_cfg, shutdown_tx.subscribe());
+    }
+
+    // Translate SIGTERM/SIGINT into the shutdown signal so registration can
+    // deregister and the server can drain gracefully.
+    let mut server_shutdown = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
+    remux_gateway::server::serve_with_shutdown(listener, rustls_config, state, async move {
+        // Resolve once the shutdown flag flips to true.
+        loop {
+            if *server_shutdown.borrow() {
+                break;
+            }
+            if server_shutdown.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+    .await
+    .map_err(|e| format!("server error: {e}"))
+}
+
+/// Await a SIGTERM or SIGINT (Ctrl-C). On non-unix or signal-install failure,
+/// fall back to Ctrl-C alone.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

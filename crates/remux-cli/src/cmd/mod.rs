@@ -7,6 +7,7 @@ pub mod kill;
 pub mod logs;
 pub mod ls;
 pub mod new;
+pub mod open;
 pub mod peek;
 pub mod rename;
 pub mod send;
