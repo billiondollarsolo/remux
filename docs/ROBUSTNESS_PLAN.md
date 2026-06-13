@@ -696,8 +696,17 @@ loses output → corrupted screen. Decide policy: either (a) coalesce to a
 
 ### 8.1 Tasks
 
-- **T6.1 Scrollback paging in attach.** Today attach is live-only. Add a copy/scroll
-  mode (prefix + `[`) to scroll the history buffer, like tmux/boo.
+- **T6.1 Scrollback paging in attach. — DONE.** Attach now has an in-client
+  copy/scroll mode (prefix + `[`, also prefix + PageUp). It maintains a bounded
+  local line buffer (seeded from `bootstrap.scrollback`, kept current by every
+  `Event::Output` chunk, capped at ~10 000 lines), enters the alternate screen
+  while scrolling, and renders a window of the buffer with a reverse-video status
+  line. Navigation: PageUp/Ctrl-b/k/Up (older), PageDown/Ctrl-f/j/Down (newer),
+  Home (oldest), End/G (newest), q/Esc (exit, repaints the live screen from the
+  last snapshot). Read-only attach supports it too. Purely client-local — no new
+  protocol messages. Windowing math (`visible_window`) and line splitting are
+  factored into pure, unit-tested helpers. Implemented in
+  `crates/remux-cli/src/cmd/attach.rs`.
 - **T6.2 Status / message line.** Brief on-attach hint ("[detach: Ctrl-A d]") and
   transient messages (control stolen, resize) rendered without corrupting the app
   (use a saved-cursor + restore, or the bottom line only).

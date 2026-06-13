@@ -90,6 +90,12 @@ pub async fn run(
             .map_err(|e| RemuxError::IoError(format!("flush error: {e}")))?;
     }
 
+    // Local line buffer for scroll (copy) mode. Seed it from the bootstrap
+    // scrollback so history is immediately scrollable, then keep it current by
+    // appending every `Event::Output` chunk (even while scrolling).
+    let mut line_buffer = LineBuffer::new(MAX_SCROLL_LINES);
+    line_buffer.seed(&bootstrap.scrollback);
+
     // Repaint the visible screen from the parsed VT snapshot so TUIs (vim,
     // htop, less) and colors come back faithfully on reattach.
     if let Some(snapshot) = bootstrap.vt_snapshot {
@@ -139,29 +145,61 @@ pub async fn run(
     // at the end of one read still composes with the command byte in the next.
     let mut prefix = PrefixMachine::new(prefix_byte);
 
+    // Scroll (copy) mode state. `None` means LIVE mode; `Some` means we are in
+    // scroll mode with the given key decoder and scroll offset (0 = newest).
+    let mut scroll: Option<(ScrollKeys, usize)> = None;
+
     // Line buffer for reading daemon events in JSON mode.
     let mut event_line = Vec::new();
 
     loop {
         tokio::select! {
-            // Handle raw stdin bytes: feed each through the prefix machine.
+            // Handle raw stdin bytes. While in scroll (copy) mode bytes drive
+            // navigation and are never forwarded to the PTY; otherwise they go
+            // through the prefix machine and on to the session.
             chunk = stdin_rx.recv() => {
                 match chunk {
                     Some(bytes) => {
+                        if let Some((keys, offset)) = scroll.as_mut() {
+                            // SCROLL MODE: decode navigation, never forward.
+                            let mut quit = false;
+                            for &b in &bytes {
+                                if let Some(nav) = keys.feed(b) {
+                                    apply_scroll_nav(nav, offset, &mut quit);
+                                }
+                            }
+                            if quit {
+                                exit_scroll_mode(&last_snapshot);
+                                scroll = None;
+                            } else {
+                                let (rows, cols) = scroll_dimensions();
+                                let view = line_buffer.view_lines();
+                                let max_off = max_scroll_offset(view.len(), rows);
+                                let off = (*offset).min(max_off);
+                                *offset = off;
+                                let painted = render_scroll_view(&view, off, rows, cols);
+                                let _ = write_to_stdout(&painted);
+                            }
+                            continue;
+                        }
+
+                        // LIVE MODE: run bytes through the prefix machine.
                         let mut forward: Vec<u8> = Vec::new();
                         let mut do_detach = false;
                         let mut do_redraw = false;
+                        let mut do_scroll = false;
                         for &b in &bytes {
                             match prefix.feed(b) {
                                 PrefixAction::Forward(out) => forward.extend_from_slice(&out),
                                 PrefixAction::Pending => {}
                                 PrefixAction::Detach => do_detach = true,
                                 PrefixAction::Redraw => do_redraw = true,
+                                PrefixAction::EnterScroll => do_scroll = true,
                             }
                         }
 
                         // In read-only mode we never forward input to the PTY;
-                        // the prefix machine still runs so detach/redraw work.
+                        // the prefix machine still runs so detach/redraw/scroll work.
                         if !read_only && !forward.is_empty() {
                             let send_req = Request::SendInput {
                                 session: session_for_input.clone(),
@@ -175,6 +213,17 @@ pub async fn run(
                                 let painted = crate::render_snapshot::paint_snapshot(snap);
                                 let _ = write_to_stdout(&painted);
                             }
+                        }
+
+                        if do_scroll {
+                            let (rows, cols) = scroll_dimensions();
+                            // Enter the alternate screen so the live view is
+                            // preserved, then render the buffer at offset 0.
+                            let _ = write_to_stdout(b"\x1b[?1049h");
+                            let view = line_buffer.view_lines();
+                            let painted = render_scroll_view(&view, 0, rows, cols);
+                            let _ = write_to_stdout(&painted);
+                            scroll = Some((ScrollKeys::new(rows.saturating_sub(1).max(1)), 0));
                         }
 
                         if do_detach {
@@ -202,6 +251,16 @@ pub async fn run(
                     client_id: client_id.clone(),
                 };
                 let _ = write_message(&mut daemon_writer, &resize_req).await;
+                // If scrolling, re-render the view at the new terminal size.
+                if let Some((_keys, offset)) = scroll.as_mut() {
+                    let (rows, cols) = scroll_dimensions();
+                    let view = line_buffer.view_lines();
+                    let max_off = max_scroll_offset(view.len(), rows);
+                    let off = (*offset).min(max_off);
+                    *offset = off;
+                    let painted = render_scroll_view(&view, off, rows, cols);
+                    let _ = write_to_stdout(&painted);
+                }
             }
             // Handle daemon events (output from the session)
             event_result = read_message::<Event>(&mut daemon_reader, &mut event_line) => {
@@ -209,7 +268,17 @@ pub async fn run(
                     Ok(Some(event)) => {
                         match event {
                             Event::Output { data, .. } => {
-                                let _ = write_to_stdout(&data);
+                                // Always keep the local scroll buffer current,
+                                // even while scrolling, so it stays live.
+                                line_buffer.append_bytes(&data);
+                                // In LIVE mode, write straight to stdout as
+                                // before. In scroll mode, withhold output (the
+                                // alternate screen is showing history) — the
+                                // buffer captured it and it'll be visible on
+                                // exit / when scrolling back to the bottom.
+                                if scroll.is_none() {
+                                    let _ = write_to_stdout(&data);
+                                }
                             }
                             Event::SessionExited { exit_code, .. } => {
                                 let msg = match exit_code {
@@ -312,6 +381,308 @@ fn human_prefix_name(s: &str) -> String {
     "Ctrl-a".to_string()
 }
 
+/// Maximum number of history lines the client keeps locally for scroll mode.
+const MAX_SCROLL_LINES: usize = 10_000;
+
+/// A bounded buffer of session output lines used by scroll (copy) mode.
+///
+/// Lines are stored without their trailing newline (and without a trailing
+/// `\r`), mirroring the daemon's `ScrollbackBuffer`. A `partial` accumulator
+/// holds the in-progress last line until a newline arrives. The buffer is
+/// capped to `max_lines`, evicting the oldest lines first.
+struct LineBuffer {
+    lines: std::collections::VecDeque<Vec<u8>>,
+    partial: Vec<u8>,
+    max_lines: usize,
+}
+
+impl LineBuffer {
+    fn new(max_lines: usize) -> Self {
+        Self {
+            lines: std::collections::VecDeque::new(),
+            partial: Vec::new(),
+            max_lines,
+        }
+    }
+
+    /// Seed the buffer from a raw scrollback blob (history bytes). Splits on
+    /// `\n`, stripping a trailing `\r` from each line. A trailing partial line
+    /// (no terminating newline) is retained in `partial` so subsequent appends
+    /// compose correctly.
+    fn seed(&mut self, data: &[u8]) {
+        self.append_bytes(data);
+    }
+
+    fn push(&mut self, line: Vec<u8>) {
+        if self.max_lines > 0 && self.lines.len() >= self.max_lines {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line);
+    }
+
+    /// Append raw output bytes, splitting on newline boundaries. Partial lines
+    /// are accumulated until a newline is seen. Mirrors
+    /// `remux-daemon::scrollback::ScrollbackBuffer::append_bytes`.
+    fn append_bytes(&mut self, data: &[u8]) {
+        self.partial.extend_from_slice(data);
+        while let Some(pos) = self.partial.iter().position(|&b| b == b'\n') {
+            let mut line = self.partial.split_off(pos + 1);
+            std::mem::swap(&mut line, &mut self.partial);
+            // `line` now holds everything up to and including the newline.
+            line.pop(); // drop '\n'
+            if line.last() == Some(&b'\r') {
+                line.pop(); // drop trailing '\r' (CRLF)
+            }
+            self.push(line);
+        }
+    }
+
+    /// All complete lines plus the current partial line (if non-empty) as a
+    /// single contiguous slice view, materialized into a `Vec` of refs. This is
+    /// the set of lines scroll mode renders over.
+    fn view_lines(&self) -> Vec<&[u8]> {
+        let mut out: Vec<&[u8]> = self.lines.iter().map(|l| l.as_slice()).collect();
+        if !self.partial.is_empty() {
+            out.push(self.partial.as_slice());
+        }
+        out
+    }
+}
+
+/// Compute the `[start, end)` line indices visible in scroll mode.
+///
+/// `total` is the number of lines available, `rows` is the terminal height
+/// (the caller reserves one row for the status line, so it passes the content
+/// height here), and `offset` is how many lines we've scrolled up from the
+/// bottom (0 = newest at the bottom). The offset is clamped to
+/// `[0, max(0, total - rows)]` so we never scroll past the oldest line.
+fn visible_window(total: usize, rows: usize, offset: usize) -> (usize, usize) {
+    if rows == 0 || total == 0 {
+        return (0, 0);
+    }
+    let max_offset = total.saturating_sub(rows);
+    let offset = offset.min(max_offset);
+    // `end` is the exclusive index of the bottom-most visible line.
+    let end = total - offset;
+    let start = end.saturating_sub(rows);
+    (start, end)
+}
+
+/// The maximum scroll offset for `total` lines and a window of `rows` rows
+/// (the caller passes the full terminal height; one row is reserved for the
+/// status line). Offset is in `[0, max]` where 0 = newest at the bottom.
+fn max_scroll_offset(total: usize, rows: usize) -> usize {
+    let content = rows.saturating_sub(1).max(1);
+    total.saturating_sub(content)
+}
+
+/// Current terminal `(rows, cols)` as `usize`, for scroll rendering.
+fn scroll_dimensions() -> (usize, usize) {
+    let size = get_terminal_size();
+    (size.rows as usize, size.cols as usize)
+}
+
+/// Apply a navigation intent to the scroll `offset` in place. Sets `quit` when
+/// the user asked to leave scroll mode. Offsets grow toward older lines; they
+/// are clamped to `>= 0` here and to the upper bound by the caller (which knows
+/// the line count and terminal height).
+fn apply_scroll_nav(nav: ScrollNav, offset: &mut usize, quit: &mut bool) {
+    match nav {
+        ScrollNav::Older(n) => *offset = offset.saturating_add(n),
+        ScrollNav::Newer(n) => *offset = offset.saturating_sub(n),
+        ScrollNav::Top => *offset = usize::MAX, // clamped to oldest by caller
+        ScrollNav::Bottom => *offset = 0,
+        ScrollNav::Quit => *quit = true,
+    }
+}
+
+/// Leave scroll mode: drop the alternate screen and repaint the live view from
+/// the last snapshot (if any).
+fn exit_scroll_mode(last_snapshot: &Option<TerminalSnapshot>) {
+    let _ = write_to_stdout(b"\x1b[?1049l");
+    if let Some(snap) = last_snapshot {
+        let painted = crate::render_snapshot::paint_snapshot(snap);
+        let _ = write_to_stdout(&painted);
+    }
+}
+
+/// A navigation intent decoded from input bytes while in scroll mode.
+#[derive(Debug, PartialEq, Eq)]
+enum ScrollNav {
+    /// Scroll toward older lines by `n` (PageUp/Ctrl-b/k/Up).
+    Older(usize),
+    /// Scroll toward newer lines by `n` (PageDown/Ctrl-f/j/Down).
+    Newer(usize),
+    /// Jump to the oldest line (Home).
+    Top,
+    /// Jump to the newest line (End/G).
+    Bottom,
+    /// Leave scroll mode (q/Esc).
+    Quit,
+}
+
+/// Stateful decoder for scroll-mode navigation. Handles single bytes (`k`,
+/// `j`, `q`, `G`) and CSI escape sequences (arrows, PageUp/PageDown, Home/End)
+/// that may be split across reads. `page` is the page size for PageUp/PageDown
+/// (typically the visible content height).
+struct ScrollKeys {
+    /// Pending escape-sequence bytes (after an ESC), if any.
+    pending: Vec<u8>,
+    page: usize,
+}
+
+impl ScrollKeys {
+    fn new(page: usize) -> Self {
+        Self {
+            pending: Vec::new(),
+            page: page.max(1),
+        }
+    }
+
+    /// Feed one byte; returns a navigation intent if one is complete.
+    fn feed(&mut self, byte: u8) -> Option<ScrollNav> {
+        if self.pending.is_empty() {
+            match byte {
+                0x1b => {
+                    // Start of a possible escape sequence. A lone ESC is
+                    // resolved on the next byte: if it isn't a CSI intro we
+                    // treat the ESC as "quit".
+                    self.pending.push(byte);
+                    None
+                }
+                b'k' => Some(ScrollNav::Older(1)),
+                b'j' => Some(ScrollNav::Newer(1)),
+                0x02 => Some(ScrollNav::Older(self.page)), // Ctrl-b
+                0x06 => Some(ScrollNav::Newer(self.page)), // Ctrl-f
+                b'G' => Some(ScrollNav::Bottom),
+                b'q' => Some(ScrollNav::Quit),
+                _ => None,
+            }
+        } else {
+            self.pending.push(byte);
+            self.try_resolve_pending()
+        }
+    }
+
+    fn try_resolve_pending(&mut self) -> Option<ScrollNav> {
+        // pending[0] is always ESC.
+        match self.pending.as_slice() {
+            // Lone ESC followed by a non-`[`/`O` byte: treat ESC as quit and
+            // drop the trailing byte (it is not a navigation key we model).
+            [0x1b, b] if *b != b'[' && *b != b'O' => {
+                self.pending.clear();
+                Some(ScrollNav::Quit)
+            }
+            // Incomplete CSI/SS3 intro: keep waiting.
+            [0x1b, b'['] | [0x1b, b'O'] => None,
+            // SS3 arrows (ESC O A/B) — some terminals in application mode.
+            [0x1b, b'O', c] => {
+                let nav = arrow_or_none(*c);
+                self.pending.clear();
+                nav
+            }
+            // CSI arrows: ESC [ A/B/C/D.
+            [0x1b, b'[', c @ (b'A' | b'B' | b'C' | b'D')] => {
+                let nav = arrow_or_none(*c);
+                self.pending.clear();
+                nav
+            }
+            // CSI Home/End without parameters: ESC [ H / ESC [ F.
+            [0x1b, b'[', b'H'] => {
+                self.pending.clear();
+                Some(ScrollNav::Top)
+            }
+            [0x1b, b'[', b'F'] => {
+                self.pending.clear();
+                Some(ScrollNav::Bottom)
+            }
+            // Parameterized CSI: ESC [ <digits> ~  (PageUp=5, PageDown=6,
+            // Home=1/7, End=4/8).
+            [0x1b, b'[', rest @ ..] => {
+                if let Some((&last, params)) = rest.split_last() {
+                    if last == b'~' {
+                        let nav = match params {
+                            b"5" => Some(ScrollNav::Older(self.page)),
+                            b"6" => Some(ScrollNav::Newer(self.page)),
+                            b"1" | b"7" => Some(ScrollNav::Top),
+                            b"4" | b"8" => Some(ScrollNav::Bottom),
+                            _ => None,
+                        };
+                        self.pending.clear();
+                        return nav;
+                    }
+                    // Still accumulating digits; bail if it grows unreasonable.
+                    if rest.len() > 8 {
+                        self.pending.clear();
+                    }
+                    None
+                } else {
+                    None
+                }
+            }
+            _ => {
+                self.pending.clear();
+                None
+            }
+        }
+    }
+}
+
+fn arrow_or_none(c: u8) -> Option<ScrollNav> {
+    match c {
+        b'A' => Some(ScrollNav::Older(1)), // Up
+        b'B' => Some(ScrollNav::Newer(1)), // Down
+        _ => None,                         // Left/Right: no-op in scroll mode
+    }
+}
+
+/// Render the scroll-mode view of `lines` at `offset` for a terminal of
+/// `total_rows` rows by `cols` columns. Returns the bytes to write to stdout.
+/// The bottom row is an inverse-video status line; the remaining rows show a
+/// window of the buffer. Each content line is prefixed with an SGR reset so
+/// color state from history lines does not bleed.
+fn render_scroll_view(lines: &[&[u8]], offset: usize, total_rows: usize, cols: usize) -> Vec<u8> {
+    let content_rows = total_rows.saturating_sub(1).max(1);
+    let total = lines.len();
+    let (start, end) = visible_window(total, content_rows, offset);
+
+    let mut out: Vec<u8> = Vec::new();
+    // Clear the screen and home the cursor (we are on the alternate screen).
+    out.extend_from_slice(b"\x1b[2J\x1b[H");
+
+    for line in &lines[start..end] {
+        // Reset SGR so color state from a prior history line doesn't bleed,
+        // then the raw line bytes (which may themselves carry SGR), then CRLF.
+        out.extend_from_slice(b"\x1b[0m");
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
+    }
+
+    // Status / indicator line on the last row, in reverse video.
+    let top = if total == 0 { 0 } else { start + 1 };
+    let bottom = end;
+    let _ = write!(
+        &mut out as &mut Vec<u8>,
+        "\x1b[{};1H\x1b[0m\x1b[7m",
+        total_rows
+    );
+    let status =
+        format!("-- SCROLL  line {top}-{bottom}/{total}  (PageUp/PageDown/k/j, q to quit) --");
+    // Truncate/pad the status to the terminal width so the reverse-video bar
+    // spans the row without wrapping.
+    let mut bar = status.into_bytes();
+    if cols > 0 {
+        bar.truncate(cols);
+        while bar.len() < cols {
+            bar.push(b' ');
+        }
+    }
+    out.extend_from_slice(&bar);
+    out.extend_from_slice(b"\x1b[0m");
+
+    out
+}
+
 /// What the prefix machine wants the caller to do with a fed byte.
 #[derive(Debug, PartialEq, Eq)]
 enum PrefixAction {
@@ -323,6 +694,8 @@ enum PrefixAction {
     Detach,
     /// Repaint from the last known snapshot.
     Redraw,
+    /// Enter scrollback (copy) mode.
+    EnterScroll,
 }
 
 /// Stateful GNU-screen-style prefix machine.
@@ -332,6 +705,7 @@ enum PrefixAction {
 /// - `d` / Ctrl-d        -> detach
 /// - `a` / prefix byte   -> send a single literal prefix byte
 /// - `l` / Ctrl-l        -> redraw from the last snapshot
+/// - `[`                 -> enter scrollback (copy) mode
 /// - any other byte X    -> prefix byte then X are both forwarded (transparency)
 ///
 /// The pending state lives in the struct so a prefix at the end of one chunk
@@ -361,6 +735,8 @@ impl PrefixMachine {
                 b if b == self.prefix => PrefixAction::Forward(vec![self.prefix]),
                 // redraw
                 0x6c | 0x0c => PrefixAction::Redraw, // 'l' or Ctrl-l
+                // enter scrollback (copy) mode
+                0x5b => PrefixAction::EnterScroll, // '['
                 // unrecognized: forward the prefix byte then this byte
                 other => PrefixAction::Forward(vec![self.prefix, other]),
             }
@@ -380,18 +756,26 @@ mod tests {
     /// Helper: feed a whole byte slice and collect the resulting actions,
     /// flattening forwarded bytes into a single buffer.
     fn drive(m: &mut PrefixMachine, bytes: &[u8]) -> (Vec<u8>, bool, bool) {
+        let (fwd, detach, redraw, _scroll) = drive_full(m, bytes);
+        (fwd, detach, redraw)
+    }
+
+    /// Like `drive` but also reports whether scroll mode was requested.
+    fn drive_full(m: &mut PrefixMachine, bytes: &[u8]) -> (Vec<u8>, bool, bool, bool) {
         let mut forward = Vec::new();
         let mut detach = false;
         let mut redraw = false;
+        let mut scroll = false;
         for &b in bytes {
             match m.feed(b) {
                 PrefixAction::Forward(out) => forward.extend_from_slice(&out),
                 PrefixAction::Pending => {}
                 PrefixAction::Detach => detach = true,
                 PrefixAction::Redraw => redraw = true,
+                PrefixAction::EnterScroll => scroll = true,
             }
         }
-        (forward, detach, redraw)
+        (forward, detach, redraw, scroll)
     }
 
     #[test]
@@ -516,5 +900,183 @@ mod tests {
         assert_eq!(fwd, chunk.to_vec());
         assert!(!detach);
         assert!(!redraw);
+    }
+
+    #[test]
+    fn prefix_then_bracket_enters_scroll() {
+        let mut m = PrefixMachine::new(0x01);
+        let (fwd, detach, redraw, scroll) = drive_full(&mut m, &[0x01, b'[']);
+        assert!(fwd.is_empty());
+        assert!(!detach);
+        assert!(!redraw);
+        assert!(scroll);
+    }
+
+    #[test]
+    fn prefix_then_bracket_scroll_does_not_fire_alone() {
+        // A lone '[' (no prefix) is forwarded, not a scroll request.
+        let mut m = PrefixMachine::new(0x01);
+        let (fwd, _d, _r, scroll) = drive_full(&mut m, b"[");
+        assert_eq!(fwd, b"[");
+        assert!(!scroll);
+    }
+
+    // ---- visible_window ----
+
+    #[test]
+    fn window_fewer_lines_than_rows() {
+        // 3 lines, 10 content rows, offset 0 -> whole buffer.
+        assert_eq!(visible_window(3, 10, 0), (0, 3));
+    }
+
+    #[test]
+    fn window_exact_fit_offset_zero() {
+        // 10 lines, 10 rows, offset 0 -> all 10.
+        assert_eq!(visible_window(10, 10, 0), (0, 10));
+    }
+
+    #[test]
+    fn window_scrolled_up() {
+        // 100 lines, 10 rows, offset 5 -> lines [85, 95).
+        assert_eq!(visible_window(100, 10, 5), (85, 95));
+    }
+
+    #[test]
+    fn window_offset_clamped_to_oldest() {
+        // 20 lines, 10 rows: max offset is 10; a larger offset clamps so the
+        // window pins to the oldest lines [0, 10).
+        assert_eq!(visible_window(20, 10, 999), (0, 10));
+    }
+
+    #[test]
+    fn window_zero_rows_or_empty() {
+        assert_eq!(visible_window(5, 0, 0), (0, 0));
+        assert_eq!(visible_window(0, 10, 0), (0, 0));
+    }
+
+    // ---- max_scroll_offset ----
+
+    #[test]
+    fn max_offset_reserves_status_row() {
+        // 21 total lines, terminal height 11 -> 10 content rows -> max 11.
+        assert_eq!(max_scroll_offset(21, 11), 11);
+        // Fewer lines than rows -> cannot scroll.
+        assert_eq!(max_scroll_offset(3, 11), 0);
+    }
+
+    // ---- LineBuffer line splitting ----
+
+    #[test]
+    fn line_buffer_seed_splits_and_strips_cr() {
+        let mut b = LineBuffer::new(100);
+        b.seed(b"alpha\r\nbeta\ngamma\r\n");
+        let v = b.view_lines();
+        assert_eq!(v, vec![&b"alpha"[..], &b"beta"[..], &b"gamma"[..]]);
+    }
+
+    #[test]
+    fn line_buffer_partial_line_carried() {
+        let mut b = LineBuffer::new(100);
+        b.append_bytes(b"hel");
+        // Partial line not yet a complete line, but visible in view.
+        assert_eq!(b.view_lines(), vec![&b"hel"[..]]);
+        b.append_bytes(b"lo\nworld");
+        assert_eq!(b.view_lines(), vec![&b"hello"[..], &b"world"[..]]);
+    }
+
+    #[test]
+    fn line_buffer_caps_at_max_lines() {
+        let mut b = LineBuffer::new(2);
+        b.append_bytes(b"one\ntwo\nthree\n");
+        // Oldest evicted; only the last two complete lines remain.
+        assert_eq!(b.view_lines(), vec![&b"two"[..], &b"three"[..]]);
+    }
+
+    // ---- ScrollKeys navigation decoding ----
+
+    #[test]
+    fn scroll_keys_single_byte_nav() {
+        let mut k = ScrollKeys::new(10);
+        assert_eq!(k.feed(b'k'), Some(ScrollNav::Older(1)));
+        assert_eq!(k.feed(b'j'), Some(ScrollNav::Newer(1)));
+        assert_eq!(k.feed(b'G'), Some(ScrollNav::Bottom));
+        assert_eq!(k.feed(b'q'), Some(ScrollNav::Quit));
+        assert_eq!(k.feed(0x02), Some(ScrollNav::Older(10))); // Ctrl-b
+        assert_eq!(k.feed(0x06), Some(ScrollNav::Newer(10))); // Ctrl-f
+    }
+
+    #[test]
+    fn scroll_keys_arrows_and_pages() {
+        let mut k = ScrollKeys::new(10);
+        // Up arrow: ESC [ A
+        assert_eq!(k.feed(0x1b), None);
+        assert_eq!(k.feed(b'['), None);
+        assert_eq!(k.feed(b'A'), Some(ScrollNav::Older(1)));
+        // PageUp: ESC [ 5 ~
+        assert_eq!(k.feed(0x1b), None);
+        assert_eq!(k.feed(b'['), None);
+        assert_eq!(k.feed(b'5'), None);
+        assert_eq!(k.feed(b'~'), Some(ScrollNav::Older(10)));
+        // PageDown: ESC [ 6 ~
+        for b in [0x1b, b'[', b'6'] {
+            assert_eq!(k.feed(b), None);
+        }
+        assert_eq!(k.feed(b'~'), Some(ScrollNav::Newer(10)));
+        // Home: ESC [ H
+        assert_eq!(k.feed(0x1b), None);
+        assert_eq!(k.feed(b'['), None);
+        assert_eq!(k.feed(b'H'), Some(ScrollNav::Top));
+    }
+
+    #[test]
+    fn scroll_keys_lone_esc_quits() {
+        let mut k = ScrollKeys::new(10);
+        assert_eq!(k.feed(0x1b), None);
+        // ESC followed by a non-CSI byte: treat ESC as quit.
+        assert_eq!(k.feed(b'x'), Some(ScrollNav::Quit));
+    }
+
+    // ---- apply_scroll_nav clamping ----
+
+    #[test]
+    fn apply_nav_moves_and_clamps_low() {
+        let mut off = 3;
+        let mut quit = false;
+        apply_scroll_nav(ScrollNav::Older(2), &mut off, &mut quit);
+        assert_eq!(off, 5);
+        apply_scroll_nav(ScrollNav::Newer(10), &mut off, &mut quit);
+        assert_eq!(off, 0); // saturates at 0, doesn't underflow
+        apply_scroll_nav(ScrollNav::Bottom, &mut off, &mut quit);
+        assert_eq!(off, 0);
+        apply_scroll_nav(ScrollNav::Top, &mut off, &mut quit);
+        assert_eq!(off, usize::MAX); // caller clamps to oldest
+        assert!(!quit);
+        apply_scroll_nav(ScrollNav::Quit, &mut off, &mut quit);
+        assert!(quit);
+    }
+
+    // ---- render_scroll_view ----
+
+    #[test]
+    fn render_scroll_view_has_status_and_lines() {
+        let lines: Vec<&[u8]> = vec![b"one", b"two", b"three"];
+        let out = render_scroll_view(&lines, 0, 4, 40);
+        let s = String::from_utf8_lossy(&out);
+        // Clears and homes.
+        assert!(s.starts_with("\x1b[2J\x1b[H"));
+        // Content lines reset SGR.
+        assert!(s.contains("\x1b[0mone\r\n"));
+        // Reverse-video status bar mentions SCROLL and the line range.
+        assert!(s.contains("\x1b[7m"));
+        assert!(s.contains("-- SCROLL"));
+        assert!(s.contains("1-3/3"));
+    }
+
+    #[test]
+    fn render_scroll_view_empty_buffer() {
+        let lines: Vec<&[u8]> = vec![];
+        let out = render_scroll_view(&lines, 0, 4, 40);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("0-0/0"));
     }
 }
