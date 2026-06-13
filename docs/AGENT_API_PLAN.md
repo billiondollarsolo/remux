@@ -255,6 +255,14 @@ structured-cells contract is shared but still gateway-owned.
 
 ## 3. AW1 — SSH Transport (`remux bridge` / `--host`)
 
+> **Status update:** AW1 has since shipped — the hidden `remux bridge`
+> subcommand, the generalized client transport (`RemuxClient` over any async
+> stream), and the global `--host <ssh-target>` routing flag are implemented and
+> tested (`crates/remux-cli/src/{client.rs,cmd/bridge.rs}`, `tests/bridge.rs`),
+> with the daemon unchanged (still Unix-socket-only). The `host:session` selector
+> sugar remains the one optional follow-up. The design below is retained as the
+> rationale of record.
+
 **Goal:** Deliver the *human* multi-host experience promised by `spec.md` §7
 without any network listener: reach a remote `remuxd` over **SSH as transport**,
 so `ssh + tmux + attach` collapses to one command. This is parallel to the
