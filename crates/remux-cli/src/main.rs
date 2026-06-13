@@ -22,6 +22,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     socket: Option<String>,
 
+    /// Run the command against a remote host over SSH (e.g. `--host devbox`).
+    /// Tunnels the protocol via `ssh <host> remux bridge`; no local daemon is
+    /// started for remote commands.
+    #[arg(long, global = true)]
+    host: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -160,6 +166,11 @@ enum Commands {
         #[arg(value_enum)]
         shell: Shell,
     },
+    /// Internal: pipe the protocol between stdin/stdout and the local daemon
+    /// socket. Run on a remote host via `ssh <host> remux bridge` to back the
+    /// `--host` remote transport. Not intended for direct use.
+    #[command(hide = true)]
+    Bridge,
 }
 
 /// Load configuration from the first existing config file location, falling
@@ -216,19 +227,48 @@ async fn main() {
     let config = load_config();
     let socket_path = get_socket_path(cli.socket.as_deref(), &config);
 
-    // Ensure the daemon is running. A failure here means the daemon is
-    // unreachable (exit code 6 per the exit-code taxonomy, §5.3).
-    if let Err(e) = daemon_spawn::ensure_daemon_running(&socket_path) {
-        eprintln!("error: {e}");
-        process::exit(6);
-    }
-
-    // Connect to the daemon. A connect failure is also "daemon unreachable" (6).
-    let mut client = match RemuxClient::connect(&socket_path).await {
-        Ok(c) => c,
-        Err(e) => {
+    // `bridge` is the remote-host half of the SSH transport: it always connects
+    // to the LOCAL daemon socket and pipes bytes. It honors the normal daemon
+    // auto-spawn so a fresh remote host can be bridged into. `--host` is ignored
+    // here (a bridge always serves its own local daemon).
+    if let Commands::Bridge = cli.command {
+        if let Err(e) = daemon_spawn::ensure_daemon_running(&socket_path) {
+            eprintln!("error: {e}");
+            process::exit(6);
+        }
+        if let Err(e) = cmd::bridge::run(&socket_path).await {
             eprintln!("error: {e}");
             process::exit(exit::exit_code_for(&e));
+        }
+        return;
+    }
+
+    // Establish the client transport. With `--host`, tunnel over SSH to the
+    // remote daemon and SKIP the local daemon auto-spawn (we never start a local
+    // daemon for a remote command). Otherwise use the local Unix socket, spawning
+    // the daemon if needed.
+    let mut client = if let Some(ref host) = cli.host {
+        match RemuxClient::connect_remote(host).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: {e}");
+                process::exit(exit::exit_code_for(&e));
+            }
+        }
+    } else {
+        // Ensure the daemon is running. A failure here means the daemon is
+        // unreachable (exit code 6 per the exit-code taxonomy, §5.3).
+        if let Err(e) = daemon_spawn::ensure_daemon_running(&socket_path) {
+            eprintln!("error: {e}");
+            process::exit(6);
+        }
+        // Connect to the daemon. A connect failure is also "daemon unreachable" (6).
+        match RemuxClient::connect(&socket_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: {e}");
+                process::exit(exit::exit_code_for(&e));
+            }
         }
     };
 
@@ -342,6 +382,7 @@ async fn main() {
         Commands::Kill { name } => cmd::kill::run(&mut client, name).await,
         // Handled before the daemon connection above.
         Commands::Completions { .. } => unreachable!("completions handled early"),
+        Commands::Bridge => unreachable!("bridge handled early"),
     };
 
     if let Err(e) = result {

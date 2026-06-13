@@ -1,4 +1,5 @@
 pub mod attach;
+pub mod bridge;
 pub mod completions;
 pub mod inspect;
 pub mod kill;

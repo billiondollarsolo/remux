@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Remux CLI client"
 
+[lib]
+name = "remux_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "remux"
 path = "src/main.rs"
@@ -24,3 +28,7 @@ chrono = "0.4"
 uuid = { version = "1", features = ["serde", "v4"] }
 libc = "0.2"
 regex = "1"
+
+[dev-dependencies]
+remux-testkit = { path = "../remux-testkit" }
+tempfile = "3"
