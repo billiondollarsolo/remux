@@ -800,6 +800,7 @@ wire-format break together so `main` is never left half-migrated.
 | macOS PTY/signal differences | `portable-pty` abstracts most; ensure CI macOS job builds and run smoke tests. |
 | Persistence semantics (Option A vs B) | Confirm A is acceptable for now (no live-process recovery). |
 | Backpressure vs resync (T5.5) | Prefer resync-on-lag using WS1 snapshot; needs the snapshot path landed first. |
+| VT engine choice (`alacritty_terminal` vs libghostty) | **Decided:** stay on `alacritty_terminal` (pure Rust, no FFI). Don't migrate speculatively. The emulator now sits behind a `TerminalEngine` trait + `vt::new_engine` factory (the single swap point), so a future change is contained. If a concrete fidelity gap appears, evaluate **`wezterm-term`** (Rust, no FFI) first, then libghostty (Zig/C-ABI, FFI cost) only if its conformance is specifically needed. |
 
 ---
 
