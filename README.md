@@ -76,14 +76,52 @@ remux ls --json              # machine-readable output
 ### Attach
 
 ```sh
-remux attach api             # by name
+remux attach api             # by name (aliases: `remux a`, `remux at`)
 remux attach <uuid>          # by ID
-# Ctrl-Q to detach
+remux attach api --read-only # observe without sending input
 ```
 
-On attach, the daemon sends scrollback history and a VT snapshot, then streams
+On attach, the daemon replays scrollback history and **repaints the screen from a
+parsed VT snapshot**, so full-screen apps (`vim`, `htop`, `less`) come back
+intact — colors, cursor, and alternate-screen state included. It then streams
 live output. Only the controlling client can send keyboard input; other clients
 attach as observers.
+
+Detach and in-attach commands use a **GNU-screen-style `Ctrl-a` prefix**
+(configurable via `detach_key`):
+
+| Keys | Action |
+|------|--------|
+| `Ctrl-a d` / `Ctrl-a Ctrl-d` | Detach |
+| `Ctrl-a a` | Send a literal `Ctrl-a` to the session |
+| `Ctrl-a l` / `Ctrl-a Ctrl-l` | Redraw the screen |
+
+All other input is forwarded to the PTY byte-for-byte (raw passthrough), so
+modifiers, paste, mouse reporting, and UTF-8 work transparently.
+
+### Automation (headless / scripting / AI agents)
+
+Every interactive action has a non-interactive equivalent with machine-readable
+output and meaningful exit codes — drive sessions without a TTY:
+
+```sh
+remux send api --text "ls -la\n"     # binary-safe input (only \n \t \r \\ interpreted)
+remux send api --bytes-hex 1b5b41    # raw bytes (ESC [ A)
+remux send api --key Enter           # named keys
+echo data | remux send api --stdin   # pipe stdin
+
+remux peek api                       # render current screen as plain text
+remux peek api --ansi                # with colors (pipe-safe; no cursor moves)
+remux peek api --json                # structured TerminalSnapshot
+
+remux wait api --idle 500ms          # block until output goes quiet
+remux wait api --for-regex 'PASS|FAIL' --timeout 30s
+remux wait api --exit                # block until the session exits (returns its code)
+```
+
+`send` injects input without attaching and without stealing control from an
+attached client. Exit codes: `0` success, `1` generic, `3` session not found,
+`4` timeout (`wait`), `5` permission denied, `6` daemon unreachable.
 
 ### Inspect, rename, kill
 
@@ -124,11 +162,20 @@ There is no live-process recovery across restarts.
 ### TUI
 
 ```sh
-remux-tui
+remux ui                     # interactive session manager (alias: `remux i`)
+remux-tui                    # the same UI as a standalone binary
 ```
 
 Interactive session list with keyboard navigation (arrows, Enter to attach,
 `k` to kill, `r` to refresh, Ctrl-Q to quit).
+
+### Shell completions
+
+```sh
+remux completions bash > /etc/bash_completion.d/remux
+remux completions zsh  > "${fpath[1]}/_remux"
+remux completions fish > ~/.config/fish/completions/remux.fish
+```
 
 ### Daemon
 
@@ -154,7 +201,7 @@ cleanup_exited_after_hours = 168                    # prune persisted sessions o
 
 [client]
 default_shell = "/bin/bash"                         # default: $SHELL or /bin/sh
-detach_key = "ctrl-q"
+detach_key = "ctrl-a"                               # prefix key; Ctrl-a d detaches
 
 [data]
 dir = "/home/user/.local/share/remux"               # default: dirs::data_dir()/remux
@@ -179,20 +226,24 @@ over a Unix domain socket:
 Messages are one of three categories:
 
 **Requests** (client → daemon):
-`Ping`, `ListSessions`, `CreateSession`, `InspectSession`, `AttachSession`,
-`DetachSession`, `ResizeSession`, `SendInput`, `ReadScrollback`, `RenameSession`,
-`KillSession`
+`Hello`, `Ping`, `ListSessions`, `CreateSession`, `InspectSession`,
+`AttachSession`, `DetachSession`, `ResizeSession`, `SendInput`, `CaptureScreen`,
+`ReadScrollback`, `RenameSession`, `KillSession`
 
 **Responses** (daemon → client):
-`Pong`, `Ok`, `Error`, `SessionList`, `SessionDetails`, `Created`, `Attached`,
-`Scrollback`
+`Hello`, `Pong`, `Ok`, `Error`, `SessionList`, `SessionDetails`, `Created`,
+`Attached`, `Screen`, `Scrollback`
 
 **Events** (daemon → client, streamed after attach):
-`Output`, `StateSnapshot`, `SessionUpdated`, `SessionExited`, `ControlLost`,
-`Error`
+`Output`, `StateSnapshot`, `SessionUpdated`, `SessionExited`,
+`SessionTerminating`, `ControlLost`, `Error`
 
-`SendInput` is fire-and-forget — the daemon does not send a response, preventing
-stale messages from accumulating during an attach event loop.
+On connect the client sends `Hello { version }`; the daemon rejects a mismatched
+`PROTOCOL_VERSION` rather than risk silent wire corruption. `SendInput` is
+fire-and-forget — the daemon does not send a response, preventing stale messages
+from accumulating during an attach event loop. When a session is detached, the
+daemon answers terminal queries (Device Attributes, cursor-position reports) on
+its behalf so a backgrounded TUI doesn't hang.
 
 ## Key Dependencies
 

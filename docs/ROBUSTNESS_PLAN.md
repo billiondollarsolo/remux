@@ -1,8 +1,15 @@
 # Remux Robustness & Usability Plan
 
-> **Status:** Proposed. This document is the single source of truth for the work
-> required to take `remux` from "working prototype" to "robust, daily-usable
-> terminal multiplexer" on par with — and beyond — [`coder/boo`](https://github.com/coder/boo).
+> **Status:** Implemented (WS0–WS6). This document is the source of truth for the
+> work taking `remux` from "working prototype" to "robust, daily-usable terminal
+> multiplexer" on par with — and beyond — [`coder/boo`](https://github.com/coder/boo).
+>
+> All seven workstreams have landed on `master`. The only intentionally deferred
+> item is **WS5 / T5.2** (the global-lock → per-session-lock refactor), which is a
+> performance optimization, not a correctness fix — see the marker in §7.
+> Resolved product decisions (see §11): detach uses a **`Ctrl-a` prefix**
+> (default, configurable); the TUI is exposed as **`remux ui`** (the `remux-tui`
+> binary remains); boo-style **command aliases** are shipped.
 >
 > Nothing in this plan touches the long-term `spec.md` roadmap (gateway, web,
 > fleet). It is exclusively about making the **local runtime** correct,
