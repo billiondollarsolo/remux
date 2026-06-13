@@ -41,9 +41,11 @@ fn main() {
     // Load config
     let config = load_config(&args.config);
 
-    // Determine socket path
+    // Determine socket path. Precedence: --socket flag, then REMUX_SOCKET_PATH
+    // env var, then the configured/default path.
     let socket_path = args
         .socket
+        .or_else(|| std::env::var_os("REMUX_SOCKET_PATH").map(PathBuf::from))
         .unwrap_or_else(|| config.daemon.socket_path.clone());
 
     info!(
