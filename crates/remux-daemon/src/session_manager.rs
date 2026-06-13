@@ -562,13 +562,47 @@ impl SessionManager {
     }
 
     /// Append raw bytes to a session's scrollback buffer and update VT state.
+    ///
+    /// After feeding the bytes through the VT, drain any responses the terminal
+    /// generated (replies to Device Attributes / cursor-position / device-status
+    /// queries). Detached terminal-query answering: if NO client is currently
+    /// attached, the daemon writes those replies back to the PTY itself so a
+    /// backgrounded TUI that queried the terminal doesn't hang waiting for an
+    /// answer. If a client IS attached, the responses are discarded — the
+    /// client's real terminal answers the queries, and writing them here too
+    /// would double-answer.
     pub fn append_to_scrollback(&mut self, session_id: &SessionId, data: &[u8]) {
         if let Some(session) = self.sessions.get_mut(session_id) {
             session
                 .scrollback
                 .append_bytes(data, &mut session.partial_line);
-            if let Some(ref mut vt) = session.vt {
-                vt.process(data);
+
+            let responses = match session.vt {
+                Some(ref mut vt) => {
+                    vt.process(data);
+                    vt.take_responses()
+                }
+                None => Vec::new(),
+            };
+
+            if responses.is_empty() {
+                return;
+            }
+
+            // Only answer queries ourselves when no real terminal is attached.
+            if session.attached_clients.is_empty() {
+                if let Some(ref mut writer) = session.pty_writer {
+                    use std::io::Write;
+                    if let Err(e) = writer.write_all(&responses).and_then(|()| writer.flush()) {
+                        // Robustness: never panic on a write error here. The PTY
+                        // may have just exited; log at debug and move on.
+                        tracing::debug!(
+                            session_id = %session_id.0,
+                            error = %e,
+                            "failed to write detached terminal-query response to pty"
+                        );
+                    }
+                }
             }
         }
     }

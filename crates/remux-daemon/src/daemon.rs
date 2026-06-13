@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
 
 use remux_core::framing;
@@ -93,25 +94,71 @@ impl Daemon {
             });
         }
 
-        // Accept connections in a loop
-        loop {
-            match listener.accept().await {
-                Ok((stream, _addr)) => {
-                    let sessions = sessions.clone();
-                    let stream_peer = stream.peer_addr().ok();
-                    tracing::debug!(peer = ?stream_peer, "accepted client connection");
+        // Install SIGTERM / SIGINT handlers for graceful shutdown. On Unix we
+        // listen for both; on receipt we flush persistence, remove the socket
+        // file, and exit cleanly.
+        let mut sigterm = signal(SignalKind::terminate())
+            .map_err(|e| RemuxError::IoError(format!("failed to install SIGTERM handler: {e}")))?;
+        let mut sigint = signal(SignalKind::interrupt())
+            .map_err(|e| RemuxError::IoError(format!("failed to install SIGINT handler: {e}")))?;
 
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, sessions).await {
-                            tracing::error!(error = %e, "client handler error");
-                        }
-                    });
+        // Accept connections, racing against shutdown signals.
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, _addr)) => {
+                        let sessions = sessions.clone();
+                        let stream_peer = stream.peer_addr().ok();
+                        tracing::debug!(peer = ?stream_peer, "accepted client connection");
+
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_client(stream, sessions).await {
+                                tracing::error!(error = %e, "client handler error");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to accept connection");
+                    }
+                },
+                _ = sigterm.recv() => {
+                    tracing::info!("received SIGTERM, shutting down gracefully");
+                    Self::graceful_shutdown(&sessions, &socket_path).await;
+                    return Ok(());
                 }
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to accept connection");
+                _ = sigint.recv() => {
+                    tracing::info!("received SIGINT, shutting down gracefully");
+                    Self::graceful_shutdown(&sessions, &socket_path).await;
+                    return Ok(());
                 }
             }
         }
+    }
+
+    /// Perform graceful shutdown cleanup: flush scrollback persistence (when
+    /// enabled), then remove the socket file. Best-effort and non-panicking;
+    /// the caller exits cleanly afterwards.
+    async fn graceful_shutdown(sessions: &SharedSessionManager, socket_path: &std::path::Path) {
+        // (a) Flush all sessions' scrollback to disk so it survives the
+        // shutdown when persistence is enabled. `flush_all_scrollback` is a
+        // no-op when `persist_scrollback` is disabled.
+        {
+            let mgr = sessions.lock().await;
+            mgr.flush_all_scrollback();
+        }
+
+        // (c) Remove the socket file so a subsequent daemon can bind cleanly.
+        if socket_path.exists() {
+            if let Err(e) = std::fs::remove_file(socket_path) {
+                tracing::warn!(
+                    socket = %socket_path.display(),
+                    error = %e,
+                    "failed to remove socket file during shutdown"
+                );
+            }
+        }
+
+        tracing::info!("graceful shutdown complete");
     }
 }
 
